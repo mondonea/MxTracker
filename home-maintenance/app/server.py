@@ -55,6 +55,7 @@ UPCOMING_WINDOW_DAYS = bounded_int_env("HOME_MAINTENANCE_UPCOMING_WINDOW_DAYS", 
 PUBLISH_HOMEASSISTANT = bool_env("HOME_MAINTENANCE_PUBLISH_HOMEASSISTANT", True)
 HOMEASSISTANT_SYNC_INTERVAL_SECONDS = bounded_int_env("HOME_MAINTENANCE_HA_SYNC_INTERVAL_SECONDS", 300, 30, 86400)
 HOMEASSISTANT_API_BASE = os.environ.get("HOME_MAINTENANCE_HA_API_BASE", "http://supervisor/core/api").rstrip("/")
+SUPERVISOR_API_BASE = os.environ.get("HOME_MAINTENANCE_SUPERVISOR_API_BASE", "http://supervisor").rstrip("/")
 SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "").strip()
 HOMEASSISTANT_REQUEST_TIMEOUT = 3
 HOMEASSISTANT_ENTITY_PREFIX = "mxtracker"
@@ -310,17 +311,62 @@ def set_setting(key, value):
         )
 
 
+def update_setting(key, value):
+    value = "" if value is None else str(value)
+    if get_setting(key) == value:
+        return False
+    set_setting(key, value)
+    return True
+
+
 def remember_ingress_base_path(base_path):
     base_path = normalize_base_path(base_path)
     if not base_path:
         return
-    if get_setting("ingress_base_path") != base_path:
-        set_setting("ingress_base_path", base_path)
+    if update_setting("ingress_base_path", base_path):
         request_homeassistant_sync()
 
 
 def get_ingress_base_path():
     return normalize_base_path(get_setting("ingress_base_path", ""))
+
+
+def get_homeassistant_ingress_base_path():
+    for key in ("supervisor_ingress_url", "ingress_base_path"):
+        value = normalize_base_path(get_setting(key, ""))
+        if value:
+            return value
+    slug = get_setting("addon_slug", "").strip()
+    if slug:
+        return f"/hassio/ingress/{quote(slug, safe='')}"
+    return ""
+
+
+def supervisor_get_json(path):
+    if not SUPERVISOR_TOKEN:
+        return {}
+    request = urllib.request.Request(
+        f"{SUPERVISOR_API_BASE}{path}",
+        headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}"},
+    )
+    with urllib.request.urlopen(request, timeout=HOMEASSISTANT_REQUEST_TIMEOUT) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    return payload.get("data", payload)
+
+
+def refresh_homeassistant_app_info():
+    try:
+        info = supervisor_get_json("/addons/self/info")
+    except (OSError, urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError):
+        return False
+    changed = False
+    ingress_url = normalize_base_path(info.get("ingress_url", ""))
+    slug = str(info.get("slug", "")).strip()
+    if ingress_url:
+        changed = update_setting("supervisor_ingress_url", ingress_url) or changed
+    if slug:
+        changed = update_setting("addon_slug", slug) or changed
+    return changed
 
 
 def summarize(tasks):
@@ -346,8 +392,16 @@ def summarize(tasks):
     }
 
 
+def homeassistant_detail_path(task_id):
+    return f"/?mx_item={task_id}"
+
+
+def homeassistant_focus_path():
+    return "/?mx_view=focus"
+
+
 def homeassistant_task_row(task, base_path=""):
-    detail_path = f"/item/{task['id']}"
+    detail_path = homeassistant_detail_path(task["id"])
     return {
         "id": task["id"],
         "name": task["name"],
@@ -365,10 +419,44 @@ def homeassistant_task_row(task, base_path=""):
     }
 
 
+def markdown_table_link(label, url):
+    safe_label = str(label).replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+    safe_label = safe_label.replace("\n", " ").replace("\r", " ").replace("|", "&#124;")
+    if not url:
+        return escape(safe_label)
+    return f"[{safe_label}]({url})"
+
+
+def homeassistant_due_table(items):
+    if not items:
+        return "Nothing is due in the next 14 days."
+    lines = [
+        "| Task | Status | Due date | Category | Last done | Repeat |",
+        "|---|---|---|---|---|---|",
+    ]
+    for item in items:
+        due = item["due_phrase"]
+        if item["is_overdue"]:
+            due = f'<span style="color: var(--error-color); font-weight: 700;">{escape(due)}</span>'
+        lines.append(
+            " | ".join(
+                [
+                    f"| {markdown_table_link(item['name'], item['detail_url'])}",
+                    due,
+                    escape(item["due_date"]),
+                    escape(item["category"]),
+                    escape(item["last_done"]),
+                    f"{escape(item['repeat'])} |",
+                ]
+            )
+        )
+    return "\n".join(lines)
+
+
 def homeassistant_state_payloads(tasks=None):
     tasks = tasks if tasks is not None else get_tasks()
     summary = summarize(tasks)
-    ingress_base_path = get_ingress_base_path()
+    ingress_base_path = get_homeassistant_ingress_base_path()
     overdue = [task for task in tasks if task["status"] == "overdue"]
     due_today = [task for task in tasks if task["status"] == "due_today"]
     upcoming_window = [
@@ -384,6 +472,7 @@ def homeassistant_state_payloads(tasks=None):
     ready = overdue + due_today
     all_items = [homeassistant_task_row(task, ingress_base_path) for task in tasks]
     dashboard_items = [homeassistant_task_row(task, ingress_base_path) for task in dashboard_tasks]
+    dashboard_table = homeassistant_due_table(dashboard_items)
     updated_at = utc_now_iso()
 
     def count_payload(name, state, icon, items):
@@ -395,7 +484,7 @@ def homeassistant_state_payloads(tasks=None):
                 "unit_of_measurement": "items",
                 "items": [homeassistant_task_row(task, ingress_base_path) for task in items],
                 "item_count": len(items),
-                "dashboard_url": homeassistant_link("/focus", ingress_base_path),
+                "dashboard_url": homeassistant_link(homeassistant_focus_path(), ingress_base_path),
                 "ingress_base_path": ingress_base_path,
                 "updated_at": updated_at,
             },
@@ -424,9 +513,10 @@ def homeassistant_state_payloads(tasks=None):
                 "icon": "mdi:calendar-alert",
                 "unit_of_measurement": "items",
                 "items": dashboard_items,
+                "markdown_table": dashboard_table,
                 "item_count": len(dashboard_items),
                 "window_days": HOMEASSISTANT_DASHBOARD_WINDOW_DAYS,
-                "dashboard_url": homeassistant_link("/focus", ingress_base_path),
+                "dashboard_url": homeassistant_link(homeassistant_focus_path(), ingress_base_path),
                 "ingress_base_path": ingress_base_path,
                 "updated_at": updated_at,
             },
@@ -516,7 +606,7 @@ def app_url(path, base_path=""):
 
 
 def homeassistant_link(path, base_path=""):
-    base_path = normalize_base_path(base_path) or get_ingress_base_path()
+    base_path = normalize_base_path(base_path) or get_homeassistant_ingress_base_path()
     return app_url(path, base_path) if base_path else app_url(path)
 
 
@@ -629,6 +719,7 @@ class HomeAssistantPublisher:
 
     def publish(self):
         try:
+            refresh_homeassistant_app_info()
             for entity_id, payload in homeassistant_state_payloads().items():
                 post_homeassistant_state(entity_id, payload)
         except (OSError, urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as error:
@@ -1660,7 +1751,17 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
             self.redirect_with_theme(return_to, safe_theme(requested))
             return
         if parsed.path == "/":
-            notice = parse_qs(parsed.query).get("notice", [""])[0]
+            query = parse_qs(parsed.query)
+            notice = query.get("notice", [""])[0]
+            mx_item = query.get("mx_item", [""])[0]
+            if mx_item.isdigit():
+                task = get_enriched_task(int(mx_item))
+                if task:
+                    self.respond_html(render_item_detail(task, csrf, notice=notice, theme=theme, base_path=base_path), csrf)
+                    return
+            if query.get("mx_view", [""])[0] == "focus":
+                self.respond_html(render_focus_view(csrf, notice=notice, theme=theme, base_path=base_path), csrf)
+                return
             self.respond_html(render_dashboard(csrf, notice=notice, theme=theme, base_path=base_path), csrf)
             return
         if parsed.path == "/items":

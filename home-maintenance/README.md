@@ -97,7 +97,7 @@ When sensor publishing is enabled, the app creates these Home Assistant sensors 
 - `sensor.mxtracker_on_track_percent`
 - `sensor.mxtracker_completed_30_days`
 
-The table sensors include an `items` attribute for dashboard cards. Each row includes a `detail_url` that opens the matching item detail page in MxTracker. Notes are not published into Home Assistant state attributes; use the app UI or CSV export for full detail.
+The due-next-14 sensor includes a ready-to-render `markdown_table` attribute for dashboard cards. The table rows link to MxTracker item detail pages. Notes are not published into Home Assistant state attributes; use the app UI or CSV export for full detail.
 
 ## Local Development
 

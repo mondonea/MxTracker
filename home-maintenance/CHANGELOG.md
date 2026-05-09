@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.3
+
+- Fixed Home Assistant dashboard links by discovering the app's Supervisor ingress URL.
+- Added a prebuilt due-next-14 Markdown table attribute for Home Assistant dashboard cards.
+- Added query-string item routing so dashboard links can open item details even when routed through the ingress root.
+
 ## 0.1.2
 
 - Added a 14-day Home Assistant dashboard sensor for overdue, current, and near-term maintenance.
