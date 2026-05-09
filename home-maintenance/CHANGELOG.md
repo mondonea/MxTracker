@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.6
+
+- Expanded item detail pages with category, status, due timing, completion count, created date, and updated date.
+- Extended tests to validate richer detail pages and item actions.
+
 ## 0.1.5
 
 - Added unit tests for Home Assistant dashboard link generation and item detail routing.

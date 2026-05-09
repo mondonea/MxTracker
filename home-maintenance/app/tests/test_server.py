@@ -58,6 +58,27 @@ class MaintenanceServerTests(unittest.TestCase):
         self.assertNotIn("Clean gutters", table)
         self.assertNotIn("private note", str(payload))
 
+    def test_dashboard_table_escapes_task_names_and_csv_export_hardens_formula_cells(self):
+        server.set_setting("supervisor_ingress_url", "/api/hassio_ingress/sessionabc")
+        today = date.today()
+        self.add_task("<script>alert(1)</script>|Filter", today, "HVAC", "=private note")
+
+        payload = server.homeassistant_state_payloads()["sensor.mxtracker_due_14_days"]
+        table = payload["attributes"]["markdown_table"]
+
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;&#124;Filter", table)
+        self.assertNotIn("<script>alert(1)</script>", table)
+        self.assertEqual(server.csv_cell(" =2+2"), "' =2+2")
+        self.assertEqual(server.csv_cell("\t=2+2"), "'\t=2+2")
+
+    def test_security_helpers_reject_unsafe_ingress_paths_and_csrf_values(self):
+        self.assertEqual(server.normalize_base_path("/api/hassio_ingress/sessionabc"), "/api/hassio_ingress/sessionabc")
+        self.assertEqual(server.normalize_base_path("/api/hassio_ingress/sessionabc?x=1"), "")
+        self.assertEqual(server.normalize_base_path("/api/hassio_ingress/sessionabc; Secure"), "")
+        self.assertTrue(server.valid_csrf_token_value("a" * 32))
+        self.assertFalse(server.valid_csrf_token_value("a" * 31))
+        self.assertFalse(server.valid_csrf_token_value("a" * 32 + "<"))
+
     def test_query_string_item_route_renders_specific_detail_page_with_history(self):
         today = date.today()
         self.add_task("Replace AC filter", today, "HVAC", "Use 20x25x1 filter.")
@@ -70,9 +91,15 @@ class MaintenanceServerTests(unittest.TestCase):
         self.assertIn("<title>Replace AC filter</title>", html)
         self.assertIn("<h2>Replace AC filter</h2>", html)
         self.assertIn("Use 20x25x1 filter.", html)
+        self.assertIn("<span>Category</span>HVAC", html)
+        self.assertIn("<span>Times completed</span>1", html)
+        self.assertIn("<span>Created</span>", html)
+        self.assertIn("<span>Updated</span>", html)
         self.assertIn("Completion History", html)
         self.assertIn(today.isoformat(), html)
         self.assertIn('action="/complete/1"', html)
+        self.assertIn('action="/snooze/1"', html)
+        self.assertIn('href="/edit/1"', html)
 
     def test_root_query_item_selection_uses_item_detail_renderer(self):
         today = date.today()

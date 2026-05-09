@@ -28,6 +28,7 @@ CSRF_COOKIE = "hm_csrf"
 THEME_COOKIE = "hm_theme"
 THEMES = {"system", "light", "dark"}
 MAX_FORM_BYTES = 16 * 1024
+CSRF_TOKEN_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
 ALLOWED_CLIENTS = {
     item.strip()
     for item in os.environ.get("HOME_MAINTENANCE_ALLOWED_CLIENTS", "172.30.32.2").split(",")
@@ -417,10 +418,10 @@ def homeassistant_task_row(task, base_path=""):
 
 
 def markdown_table_link(label, url):
-    safe_label = str(label).replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+    safe_label = escape(label).replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
     safe_label = safe_label.replace("\n", " ").replace("\r", " ").replace("|", "&#124;")
     if not url:
-        return escape(safe_label)
+        return safe_label
     return f"[{safe_label}]({url})"
 
 
@@ -574,7 +575,7 @@ def public_task(task):
 
 def csv_cell(value):
     text = "" if value is None else str(value)
-    if text.startswith(("=", "+", "-", "@")):
+    if text.startswith(("\t", "\r")) or text.lstrip().startswith(("=", "+", "-", "@")):
         return "'" + text
     return text
 
@@ -591,8 +592,16 @@ def safe_theme(value):
     return value if value in THEMES else "system"
 
 
+def valid_csrf_token_value(value):
+    return 32 <= len(value) <= 128 and all(char in CSRF_TOKEN_CHARS for char in value)
+
+
 def normalize_base_path(value):
     if not value or not value.startswith("/") or "://" in value:
+        return ""
+    if any(char in value for char in ("\r", "\n", "\t", ";", ",", "\\", "?", "#")):
+        return ""
+    if any(char.isspace() for char in value):
         return ""
     return value.rstrip("/")
 
@@ -1575,6 +1584,7 @@ def render_items_audit(csrf_token, notice="", theme="system", base_path=""):
 
 def render_item_detail(task, csrf_token, notice="", theme="system", base_path=""):
     history = get_task_history(task["id"])
+    history_count = len(history)
     status_class = " overdue" if task["status"] == "overdue" else ""
     complete_url = app_url(f"/complete/{task['id']}", base_path)
     snooze_url = app_url(f"/snooze/{task['id']}", base_path)
@@ -1609,10 +1619,15 @@ def render_item_detail(task, csrf_token, notice="", theme="system", base_path=""
           <span class="badge {task["status"]}">{escape(task["due_phrase"])}</span>
         </div>
         <div class="detail-grid">
+          <div class="detail-field"><span>Category</span>{escape(task["category"])}</div>
+          <div class="detail-field"><span>Status</span>{escape(task["status_label"])}</div>
           <div class="detail-field"><span>Next due</span>{escape(task["next_due_on"])}</div>
+          <div class="detail-field"><span>Due timing</span>{escape(task["due_phrase"])}</div>
           <div class="detail-field"><span>Last done</span>{escape(task["last_completed_on"] or "Never")}</div>
           <div class="detail-field"><span>Repeat</span>{escape(task["recurrence_phrase"])}</div>
-          <div class="detail-field"><span>Status</span>{escape(task["status_label"])}</div>
+          <div class="detail-field"><span>Times completed</span>{history_count}</div>
+          <div class="detail-field"><span>Created</span>{escape(task["created_at"])}</div>
+          <div class="detail-field"><span>Updated</span>{escape(task["updated_at"])}</div>
         </div>
         <h2>Details</h2>
         {notes}
@@ -1887,9 +1902,14 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError as error:
             raise ValueError("Invalid content length.") from error
+        if length < 0:
+            raise ValueError("Invalid content length.")
         if length > MAX_FORM_BYTES:
             raise ValueError("Form payload is too large.")
-        raw = self.rfile.read(length).decode("utf-8")
+        try:
+            raw = self.rfile.read(length).decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("Form payload must be UTF-8.") from error
         parsed = parse_qs(raw, keep_blank_values=True)
         return {key: values[0] for key, values in parsed.items()}
 
@@ -1909,14 +1929,16 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
     def get_or_create_csrf_token(self):
         cookie = SimpleCookie(self.headers.get("Cookie"))
         morsel = cookie.get(CSRF_COOKIE)
-        if morsel and len(morsel.value) >= 32:
+        if morsel and valid_csrf_token_value(morsel.value):
             return morsel.value
         return secrets.token_urlsafe(32)
 
     def valid_csrf(self, submitted):
         cookie = SimpleCookie(self.headers.get("Cookie"))
         morsel = cookie.get(CSRF_COOKIE)
-        return bool(morsel and submitted and secrets.compare_digest(morsel.value, submitted))
+        if not morsel or not submitted or not valid_csrf_token_value(morsel.value):
+            return False
+        return secrets.compare_digest(morsel.value, submitted)
 
     def current_theme(self):
         cookie = SimpleCookie(self.headers.get("Cookie"))
