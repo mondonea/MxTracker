@@ -332,13 +332,12 @@ def get_ingress_base_path():
 
 
 def get_homeassistant_ingress_base_path():
-    for key in ("supervisor_ingress_url", "ingress_base_path"):
-        value = normalize_base_path(get_setting(key, ""))
-        if value:
-            return value
     slug = get_setting("addon_slug", "").strip()
     if slug:
         return f"/hassio/ingress/{quote(slug, safe='')}"
+    value = normalize_base_path(get_setting("ingress_base_path", ""))
+    if value:
+        return value
     return ""
 
 

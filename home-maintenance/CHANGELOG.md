@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.4
+
+- Fixed dashboard detail links to use Home Assistant's frontend ingress route.
+- Kept query-string item routing so each table row opens the matching maintenance detail page.
+
 ## 0.1.3
 
 - Fixed Home Assistant dashboard links by discovering the app's Supervisor ingress URL.
