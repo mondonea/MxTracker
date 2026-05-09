@@ -332,12 +332,10 @@ def get_ingress_base_path():
 
 
 def get_homeassistant_ingress_base_path():
-    slug = get_setting("addon_slug", "").strip()
-    if slug:
-        return f"/hassio/ingress/{quote(slug, safe='')}"
-    value = normalize_base_path(get_setting("ingress_base_path", ""))
-    if value:
-        return value
+    for key in ("supervisor_ingress_url", "ingress_base_path"):
+        value = normalize_base_path(get_setting(key, ""))
+        if value:
+            return value
     return ""
 
 
@@ -1450,6 +1448,17 @@ def render_dashboard(csrf_token, notice="", theme="system", base_path=""):
     return render_layout("Home Maintenance", body, csrf_token, notice, theme, base_path)
 
 
+def render_root_page(query, csrf_token, notice="", theme="system", base_path=""):
+    mx_item = query.get("mx_item", [""])[0]
+    if mx_item.isdigit():
+        task = get_enriched_task(int(mx_item))
+        if task:
+            return render_item_detail(task, csrf_token, notice=notice, theme=theme, base_path=base_path)
+    if query.get("mx_view", [""])[0] == "focus":
+        return render_focus_view(csrf_token, notice=notice, theme=theme, base_path=base_path)
+    return render_dashboard(csrf_token, notice=notice, theme=theme, base_path=base_path)
+
+
 def render_focus_view(csrf_token, notice="", theme="system", base_path=""):
     tasks = [
         task
@@ -1752,16 +1761,7 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
         if parsed.path == "/":
             query = parse_qs(parsed.query)
             notice = query.get("notice", [""])[0]
-            mx_item = query.get("mx_item", [""])[0]
-            if mx_item.isdigit():
-                task = get_enriched_task(int(mx_item))
-                if task:
-                    self.respond_html(render_item_detail(task, csrf, notice=notice, theme=theme, base_path=base_path), csrf)
-                    return
-            if query.get("mx_view", [""])[0] == "focus":
-                self.respond_html(render_focus_view(csrf, notice=notice, theme=theme, base_path=base_path), csrf)
-                return
-            self.respond_html(render_dashboard(csrf, notice=notice, theme=theme, base_path=base_path), csrf)
+            self.respond_html(render_root_page(query, csrf, notice=notice, theme=theme, base_path=base_path), csrf)
             return
         if parsed.path == "/items":
             notice = parse_qs(parsed.query).get("notice", [""])[0]

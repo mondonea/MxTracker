@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.5
+
+- Added unit tests for Home Assistant dashboard link generation and item detail routing.
+- Fixed dashboard detail links to use the Supervisor ingress proxy URL that forwards query strings into the app.
+
 ## 0.1.4
 
 - Fixed dashboard detail links to use Home Assistant's frontend ingress route.

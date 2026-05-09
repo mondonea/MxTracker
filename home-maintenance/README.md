@@ -112,3 +112,9 @@ To enable request logs while debugging, set:
 ```text
 HOME_MAINTENANCE_LOG_REQUESTS=true
 ```
+
+Run the unit tests with:
+
+```text
+python3 -m unittest discover -s home-maintenance/app/tests -p 'test_*.py'
+```
