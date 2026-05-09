@@ -1,0 +1,96 @@
+# Home Maintenance Tracker
+
+Track recurring home maintenance tasks from inside Home Assistant.
+
+## Features
+
+- Add, edit, and delete maintenance tasks.
+- Mark tasks complete.
+- Track overdue, due today, upcoming, and later items.
+- View dashboard metrics for overdue work, current work, upcoming work, on-track percentage, and recent completions.
+- Audit a full list of maintenance items with last completed and next due dates.
+- Export maintenance items and completion history to CSV.
+- Group tasks into practical home categories such as HVAC, Appliances, Exterior, Yard, and Safety.
+- Snooze a task for 7 days when it needs to move out of today's work.
+- Switch between System, Light, and Dark themes from inside the app.
+- Use mobile-friendly card views inside Home Assistant on a phone.
+- Store task history locally.
+- Provide read-only JSON API endpoints for future Home Assistant sensors.
+
+## Privacy
+
+This add-on stores data locally in `/data/home-maintenance.db`. It does not send maintenance data to GitHub, Home Assistant Cloud, or any external service.
+
+The app only accepts requests from Home Assistant's Ingress gateway by default.
+
+Request logging is disabled by default to reduce disk noise and avoid storing household activity details in logs.
+
+The add-on exposes no public port by default. Use the Home Assistant sidebar entry named **Maintenance** to open the app.
+
+## Resource Use
+
+The add-on is intentionally lean:
+
+- Python standard library only.
+- No background workers.
+- No frontend build step.
+- Single-process HTTP server for Home Assistant Ingress use.
+- SQLite with indexes for due-date and history lookups.
+- Form payloads are capped to limit accidental or abusive memory use.
+
+## Home Assistant Management
+
+The add-on is configured for Home Assistant-first use:
+
+- Ingress web UI.
+- Sidebar panel.
+- Local `/data` storage included in add-on backups.
+- Add-on configuration options for the Upcoming window and debug request logging.
+- Read-only JSON endpoints for future Home Assistant dashboard sensors.
+
+## Dashboard
+
+The dashboard is grouped around how maintenance is usually handled:
+
+- **Overdue**: tasks that need attention first.
+- **Current**: tasks due today.
+- **Upcoming**: tasks due in the next 30 days.
+- **Later**: scheduled tasks beyond the next 30 days.
+
+Each row shows the category, due timing, recurrence, last completion date, and quick actions.
+
+## Audit And Export
+
+The **All items** view shows every maintenance item with category, status, last completed date, next due date, recurrence, and quick actions.
+
+CSV exports are available for:
+
+- Maintenance items.
+- Completion history.
+
+## Theme
+
+Use the theme control in the header to choose **System**, **Light**, or **Dark** mode. The preference is stored locally in the browser cookie for the Home Assistant session.
+
+## API
+
+Read-only endpoints:
+
+- `/api/summary`
+- `/api/tasks`
+
+These are intended for local Home Assistant use.
+
+## Local Development
+
+For local testing outside Home Assistant, set:
+
+```text
+HOME_MAINTENANCE_ALLOWED_CLIENTS=127.0.0.1,::1
+```
+
+To enable request logs while debugging, set:
+
+```text
+HOME_MAINTENANCE_LOG_REQUESTS=true
+```

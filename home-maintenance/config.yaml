@@ -1,0 +1,27 @@
+name: Home Maintenance Tracker
+version: "0.1.0"
+slug: home_maintenance
+description: Track recurring home maintenance tasks from inside Home Assistant.
+url: https://github.com/mondonea/MxTracker
+arch:
+  - aarch64
+  - amd64
+  - armv7
+startup: application
+boot: auto
+init: false
+ingress: true
+ingress_port: 8099
+ingress_entry: /
+panel_icon: mdi:home-clock
+panel_title: Maintenance
+panel_admin: false
+ports: {}
+ports_description: {}
+options:
+  upcoming_window_days: 30
+  request_logging: false
+schema:
+  upcoming_window_days: int
+  request_logging: bool
+backup: hot
