@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1
+
+- Added Home Assistant sensor publishing for dashboard cards and maintenance audit tables.
+- Added app options to enable or disable sensor publishing and tune the publish interval.
+- Added compact table attributes for overdue, due today, upcoming, ready, and all maintenance items.
+
 ## 0.1.0
 
 - Initial Home Assistant add-on.

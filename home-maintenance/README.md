@@ -15,7 +15,8 @@ Track recurring home maintenance tasks from inside Home Assistant.
 - Switch between System, Light, and Dark themes from inside the app.
 - Use mobile-friendly card views inside Home Assistant on a phone.
 - Store task history locally.
-- Provide read-only JSON API endpoints for future Home Assistant sensors.
+- Publish Home Assistant sensors for summary cards and maintenance table attributes.
+- Provide read-only JSON API endpoints for local integrations and troubleshooting.
 
 ## Privacy
 
@@ -32,7 +33,7 @@ The add-on exposes no public port by default. Use the Home Assistant sidebar ent
 The add-on is intentionally lean:
 
 - Python standard library only.
-- No background workers.
+- One lightweight background publisher for Home Assistant sensor updates.
 - No frontend build step.
 - Single-process HTTP server for Home Assistant Ingress use.
 - SQLite with indexes for due-date and history lookups.
@@ -45,8 +46,8 @@ The add-on is configured for Home Assistant-first use:
 - Ingress web UI.
 - Sidebar panel.
 - Local `/data` storage included in add-on backups.
-- Add-on configuration options for the Upcoming window and debug request logging.
-- Read-only JSON endpoints for future Home Assistant dashboard sensors.
+- Add-on configuration options for the Upcoming window, sensor publishing, publish interval, and debug request logging.
+- Home Assistant sensors for dashboard cards and maintenance audit tables.
 
 ## Dashboard
 
@@ -80,6 +81,20 @@ Read-only endpoints:
 - `/api/tasks`
 
 These are intended for local Home Assistant use.
+
+## Home Assistant Sensors
+
+When sensor publishing is enabled, the app creates these Home Assistant sensors through the internal Home Assistant API:
+
+- `sensor.mxtracker_overdue`
+- `sensor.mxtracker_due_today`
+- `sensor.mxtracker_upcoming_30_days`
+- `sensor.mxtracker_ready`
+- `sensor.mxtracker_all_items`
+- `sensor.mxtracker_on_track_percent`
+- `sensor.mxtracker_completed_30_days`
+
+The table sensors include an `items` attribute for dashboard Markdown cards. Notes are not published into Home Assistant state attributes; use the app UI or CSV export for full detail.
 
 ## Local Development
 

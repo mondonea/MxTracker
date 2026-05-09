@@ -18,6 +18,8 @@ These options are available from the Home Assistant add-on configuration page:
 
 - **upcoming_window_days**: Controls how many days appear in the dashboard's Upcoming section. Default: `30`.
 - **request_logging**: Enables request logs for debugging. Default: `false`.
+- **publish_homeassistant_sensors**: Publishes Home Assistant sensors for dashboard cards. Default: `true`.
+- **homeassistant_publish_interval_seconds**: Republishes sensors on a timer in addition to immediate updates after edits. Default: `300`.
 
 ## Installation Source
 
@@ -79,14 +81,63 @@ Spreadsheet safety note: exported text cells that begin with formula-like charac
 
 ## Home Assistant Dashboard Sensors
 
-The app provides read-only endpoints for Home Assistant sensors:
+The app publishes Home Assistant sensors directly through the internal Home Assistant API when `publish_homeassistant_sensors` is enabled:
+
+- `sensor.mxtracker_overdue`
+- `sensor.mxtracker_due_today`
+- `sensor.mxtracker_upcoming_30_days`
+- `sensor.mxtracker_ready`
+- `sensor.mxtracker_all_items`
+- `sensor.mxtracker_on_track_percent`
+- `sensor.mxtracker_completed_30_days`
+
+The table sensors expose an `items` attribute with compact rows:
+
+- `name`
+- `category`
+- `status`
+- `due_date`
+- `due_phrase`
+- `days_until`
+- `last_done`
+- `repeat`
+
+Notes are intentionally not published into Home Assistant state attributes. They remain available inside the app UI and CSV exports.
+
+Example Markdown dashboard card:
+
+```yaml
+type: markdown
+title: Home Maintenance Audit
+content: |
+  | Task | Category | Due | Last done |
+  |---|---|---|---|
+  {% for item in state_attr('sensor.mxtracker_all_items', 'items') or [] %}
+  | {{ item.name }} | {{ item.category }} | {{ item.due_date }} | {{ item.last_done }} |
+  {% endfor %}
+```
+
+Example overdue card:
+
+```yaml
+type: markdown
+title: Overdue Maintenance
+content: |
+  | Task | Due | Last done |
+  |---|---|---|
+  {% for item in state_attr('sensor.mxtracker_overdue', 'items') or [] %}
+  | {{ item.name }} | {{ item.due_phrase }} | {{ item.last_done }} |
+  {% endfor %}
+```
+
+The app also provides read-only endpoints for local integrations or troubleshooting:
 
 - `/api/summary`
 - `/api/tasks`
 
-The recommended first integration is a local REST sensor that reads `/api/summary`. Ingress remains the preferred UI access path; do not expose a public port for the add-on.
+Ingress remains the preferred UI access path; do not expose a public port for the app.
 
-Example Home Assistant REST sensor:
+Fallback REST sensor example:
 
 ```yaml
 sensor:

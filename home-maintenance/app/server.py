@@ -6,6 +6,10 @@ import json
 import os
 import secrets
 import sqlite3
+import threading
+import time
+import urllib.error
+import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from http import HTTPStatus
 from http.cookies import SimpleCookie
@@ -24,12 +28,18 @@ CSRF_COOKIE = "hm_csrf"
 THEME_COOKIE = "hm_theme"
 THEMES = {"system", "light", "dark"}
 MAX_FORM_BYTES = 16 * 1024
-LOG_REQUESTS = os.environ.get("HOME_MAINTENANCE_LOG_REQUESTS", "false").lower() == "true"
 ALLOWED_CLIENTS = {
     item.strip()
     for item in os.environ.get("HOME_MAINTENANCE_ALLOWED_CLIENTS", "172.30.32.2").split(",")
     if item.strip()
 }
+
+
+def bool_env(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def bounded_int_env(name, default, minimum, maximum):
@@ -40,7 +50,16 @@ def bounded_int_env(name, default, minimum, maximum):
     return max(minimum, min(maximum, value))
 
 
+LOG_REQUESTS = bool_env("HOME_MAINTENANCE_LOG_REQUESTS", False)
 UPCOMING_WINDOW_DAYS = bounded_int_env("HOME_MAINTENANCE_UPCOMING_WINDOW_DAYS", 30, 1, 365)
+PUBLISH_HOMEASSISTANT = bool_env("HOME_MAINTENANCE_PUBLISH_HOMEASSISTANT", True)
+HOMEASSISTANT_SYNC_INTERVAL_SECONDS = bounded_int_env("HOME_MAINTENANCE_HA_SYNC_INTERVAL_SECONDS", 300, 30, 86400)
+HOMEASSISTANT_API_BASE = os.environ.get("HOME_MAINTENANCE_HA_API_BASE", "http://supervisor/core/api").rstrip("/")
+SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "").strip()
+HOMEASSISTANT_REQUEST_TIMEOUT = 3
+HOMEASSISTANT_ENTITY_PREFIX = "mxtracker"
+HA_PUBLISHER = None
+
 
 
 def today_iso():
@@ -257,6 +276,94 @@ def summarize(tasks):
     }
 
 
+def homeassistant_task_row(task):
+    return {
+        "name": task["name"],
+        "category": task["category"],
+        "status": task["status_label"],
+        "due_date": task["next_due_on"],
+        "due_phrase": task["due_phrase"],
+        "days_until": task["days_until"],
+        "last_done": task["last_completed_on"] or "Never",
+        "repeat": task["recurrence_phrase"],
+    }
+
+
+def homeassistant_state_payloads(tasks=None):
+    tasks = tasks if tasks is not None else get_tasks()
+    summary = summarize(tasks)
+    overdue = [task for task in tasks if task["status"] == "overdue"]
+    due_today = [task for task in tasks if task["status"] == "due_today"]
+    upcoming_window = [
+        task
+        for task in tasks
+        if task["status"] == "upcoming" and task["days_until"] <= UPCOMING_WINDOW_DAYS
+    ]
+    ready = overdue + due_today
+    all_items = [homeassistant_task_row(task) for task in tasks]
+    updated_at = utc_now_iso()
+
+    def count_payload(name, state, icon, items):
+        return {
+            "state": str(state),
+            "attributes": {
+                "friendly_name": name,
+                "icon": icon,
+                "unit_of_measurement": "items",
+                "items": [homeassistant_task_row(task) for task in items],
+                "item_count": len(items),
+                "updated_at": updated_at,
+            },
+        }
+
+    return {
+        f"sensor.{HOMEASSISTANT_ENTITY_PREFIX}_overdue": count_payload(
+            "MxTracker Overdue", summary["overdue"], "mdi:alert-circle-outline", overdue
+        ),
+        f"sensor.{HOMEASSISTANT_ENTITY_PREFIX}_due_today": count_payload(
+            "MxTracker Due Today", summary["due_today"], "mdi:calendar-today", due_today
+        ),
+        f"sensor.{HOMEASSISTANT_ENTITY_PREFIX}_upcoming_30_days": count_payload(
+            f"MxTracker Upcoming {UPCOMING_WINDOW_DAYS} Days",
+            summary["upcoming_window"],
+            "mdi:calendar-clock",
+            upcoming_window,
+        ),
+        f"sensor.{HOMEASSISTANT_ENTITY_PREFIX}_ready": count_payload(
+            "MxTracker Ready", summary["ready_count"], "mdi:format-list-checks", ready
+        ),
+        f"sensor.{HOMEASSISTANT_ENTITY_PREFIX}_all_items": {
+            "state": str(summary["total"]),
+            "attributes": {
+                "friendly_name": "MxTracker All Items",
+                "icon": "mdi:home-clock",
+                "unit_of_measurement": "items",
+                "items": all_items,
+                "item_count": len(all_items),
+                "updated_at": updated_at,
+            },
+        },
+        f"sensor.{HOMEASSISTANT_ENTITY_PREFIX}_on_track_percent": {
+            "state": str(summary["on_track_percent"]),
+            "attributes": {
+                "friendly_name": "MxTracker On Track",
+                "icon": "mdi:percent-circle-outline",
+                "unit_of_measurement": "%",
+                "updated_at": updated_at,
+            },
+        },
+        f"sensor.{HOMEASSISTANT_ENTITY_PREFIX}_completed_30_days": {
+            "state": str(summary["completed_30_days"]),
+            "attributes": {
+                "friendly_name": "MxTracker Completed 30 Days",
+                "icon": "mdi:check-circle-outline",
+                "unit_of_measurement": "items",
+                "updated_at": updated_at,
+            },
+        },
+    }
+
+
 def public_task(task):
     if not task:
         return None
@@ -363,6 +470,78 @@ def history_csv():
     return output.getvalue()
 
 
+def post_homeassistant_state(entity_id, payload):
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(
+        f"{HOMEASSISTANT_API_BASE}/states/{entity_id}",
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {SUPERVISOR_TOKEN}",
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body)),
+        },
+    )
+    with urllib.request.urlopen(request, timeout=HOMEASSISTANT_REQUEST_TIMEOUT) as response:
+        response.read()
+
+
+class HomeAssistantPublisher:
+    def __init__(self):
+        self.event = threading.Event()
+        self.thread = threading.Thread(target=self.run, name="ha-state-publisher", daemon=True)
+        self.last_error = None
+        self.started = False
+
+    def start(self):
+        if not PUBLISH_HOMEASSISTANT:
+            print("Home Assistant sensor publishing is disabled.")
+            return
+        if not SUPERVISOR_TOKEN:
+            print("Home Assistant sensor publishing skipped: SUPERVISOR_TOKEN is unavailable.")
+            return
+        self.started = True
+        self.thread.start()
+        self.request_sync()
+
+    def request_sync(self):
+        if self.started:
+            self.event.set()
+
+    def run(self):
+        next_publish_at = 0
+        while True:
+            timeout = max(0, next_publish_at - time.monotonic()) if next_publish_at else 0
+            self.event.wait(timeout)
+            self.event.clear()
+            self.publish()
+            next_publish_at = time.monotonic() + HOMEASSISTANT_SYNC_INTERVAL_SECONDS
+
+    def publish(self):
+        try:
+            for entity_id, payload in homeassistant_state_payloads().items():
+                post_homeassistant_state(entity_id, payload)
+        except (OSError, urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as error:
+            self.report_error(str(error))
+            return
+        except Exception as error:
+            self.report_error(f"{type(error).__name__}: {error}")
+            return
+        if self.last_error:
+            print("Home Assistant sensor publishing recovered.")
+            self.last_error = None
+
+    def report_error(self, message):
+        if message != self.last_error:
+            print(f"Home Assistant sensor publishing failed: {message}")
+            self.last_error = message
+
+
+def request_homeassistant_sync():
+    if HA_PUBLISHER is not None:
+        HA_PUBLISHER.request_sync()
+
+
 def validate_task_form(fields):
     errors = []
     name = fields.get("name", "").strip()
@@ -442,6 +621,7 @@ def save_task(fields, task_id=None):
                     task_id,
                 ),
             )
+    request_homeassistant_sync()
 
 
 def complete_task(task_id):
@@ -472,6 +652,7 @@ def complete_task(task_id):
             """,
             (task_id, task["name"], completed_on, next_due, now),
         )
+    request_homeassistant_sync()
     return True
 
 
@@ -485,12 +666,14 @@ def snooze_task(task_id, days=7):
             "UPDATE tasks SET next_due_on = ?, updated_at = ? WHERE id = ?",
             (next_due, utc_now_iso(), task_id),
         )
+    request_homeassistant_sync()
     return True
 
 
 def delete_task(task_id):
     with connect_db() as conn:
         conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+    request_homeassistant_sync()
 
 
 def render_layout(title, body, csrf_token, notice="", theme="system", base_path=""):
@@ -1413,7 +1596,10 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
 
 
 def main():
+    global HA_PUBLISHER
     init_db()
+    HA_PUBLISHER = HomeAssistantPublisher()
+    HA_PUBLISHER.start()
     server = HTTPServer((HOST, PORT), MaintenanceHandler)
     print(f"Home Maintenance Tracker listening on {HOST}:{PORT}")
     server.serve_forever()
