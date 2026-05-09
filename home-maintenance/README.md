@@ -8,6 +8,8 @@ Track recurring home maintenance tasks from inside Home Assistant.
 - Mark tasks complete.
 - Track overdue, due today, upcoming, and later items.
 - View dashboard metrics for overdue work, current work, upcoming work, on-track percentage, and recent completions.
+- Open a focused 14-day dashboard view for overdue, current, and near-term work.
+- Click into each maintenance item to review details, actions, and completion history.
 - Audit a full list of maintenance items with last completed and next due dates.
 - Export maintenance items and completion history to CSV.
 - Group tasks into practical home categories such as HVAC, Appliances, Exterior, Yard, and Safety.
@@ -89,12 +91,13 @@ When sensor publishing is enabled, the app creates these Home Assistant sensors 
 - `sensor.mxtracker_overdue`
 - `sensor.mxtracker_due_today`
 - `sensor.mxtracker_upcoming_30_days`
+- `sensor.mxtracker_due_14_days`
 - `sensor.mxtracker_ready`
 - `sensor.mxtracker_all_items`
 - `sensor.mxtracker_on_track_percent`
 - `sensor.mxtracker_completed_30_days`
 
-The table sensors include an `items` attribute for dashboard Markdown cards. Notes are not published into Home Assistant state attributes; use the app UI or CSV export for full detail.
+The table sensors include an `items` attribute for dashboard cards. Each row includes a `detail_url` that opens the matching item detail page in MxTracker. Notes are not published into Home Assistant state attributes; use the app UI or CSV export for full detail.
 
 ## Local Development
 

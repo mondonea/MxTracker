@@ -86,6 +86,7 @@ The app publishes Home Assistant sensors directly through the internal Home Assi
 - `sensor.mxtracker_overdue`
 - `sensor.mxtracker_due_today`
 - `sensor.mxtracker_upcoming_30_days`
+- `sensor.mxtracker_due_14_days`
 - `sensor.mxtracker_ready`
 - `sensor.mxtracker_all_items`
 - `sensor.mxtracker_on_track_percent`
@@ -96,15 +97,36 @@ The table sensors expose an `items` attribute with compact rows:
 - `name`
 - `category`
 - `status`
+- `status_key`
+- `is_overdue`
 - `due_date`
 - `due_phrase`
 - `days_until`
 - `last_done`
 - `repeat`
+- `detail_url`
 
 Notes are intentionally not published into Home Assistant state attributes. They remain available inside the app UI and CSV exports.
 
-Example Markdown dashboard card:
+Example interactive due-soon dashboard card:
+
+```yaml
+type: markdown
+title: Maintenance Due Soon
+content: |
+  {%- for item in state_attr('sensor.mxtracker_due_14_days', 'items') or [] %}
+  {%- if item.is_overdue %}
+  <ha-alert alert-type="error">[{{ item.name }}]({{ item.detail_url }}) - {{ item.due_phrase }} - {{ item.last_done }}</ha-alert>
+  {%- else %}
+  [**{{ item.name }}**]({{ item.detail_url }})<br>
+  {{ item.category }} - {{ item.due_phrase }} - Last done {{ item.last_done }}
+  {%- endif %}
+  {%- else %}
+  Nothing is due in the next 14 days.
+  {%- endfor %}
+```
+
+Example full audit table:
 
 ```yaml
 type: markdown
@@ -112,22 +134,9 @@ title: Home Maintenance Audit
 content: |
   | Task | Category | Due | Last done |
   |---|---|---|---|
-  {% for item in state_attr('sensor.mxtracker_all_items', 'items') or [] %}
-  | {{ item.name }} | {{ item.category }} | {{ item.due_date }} | {{ item.last_done }} |
-  {% endfor %}
-```
-
-Example overdue card:
-
-```yaml
-type: markdown
-title: Overdue Maintenance
-content: |
-  | Task | Due | Last done |
-  |---|---|---|
-  {% for item in state_attr('sensor.mxtracker_overdue', 'items') or [] %}
-  | {{ item.name }} | {{ item.due_phrase }} | {{ item.last_done }} |
-  {% endfor %}
+  {%- for item in state_attr('sensor.mxtracker_all_items', 'items') or [] %}
+  | [{{ item.name }}]({{ item.detail_url }}) | {{ item.category }} | {{ item.due_date }} | {{ item.last_done }} |
+  {%- endfor %}
 ```
 
 The app also provides read-only endpoints for local integrations or troubleshooting:

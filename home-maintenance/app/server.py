@@ -58,6 +58,7 @@ HOMEASSISTANT_API_BASE = os.environ.get("HOME_MAINTENANCE_HA_API_BASE", "http://
 SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "").strip()
 HOMEASSISTANT_REQUEST_TIMEOUT = 3
 HOMEASSISTANT_ENTITY_PREFIX = "mxtracker"
+HOMEASSISTANT_DASHBOARD_WINDOW_DAYS = 14
 HA_PUBLISHER = None
 
 
@@ -193,6 +194,14 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_next_due_on ON tasks(next_due_on, name)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_category ON tasks(category)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_history_completed_on ON completion_history(completed_on DESC, id DESC)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
 
 
 def get_tasks():
@@ -217,6 +226,21 @@ def get_task(task_id):
     return dict(row) if row else None
 
 
+def enrich_task(task):
+    task["category"] = task.get("category") or "General"
+    task["status"] = classify_due(task["next_due_on"])
+    task["status_label"] = status_label(task["status"])
+    task["days_until"] = days_until(task["next_due_on"])
+    task["due_phrase"] = due_phrase(task["days_until"])
+    task["recurrence_phrase"] = recurrence_phrase(task["interval_count"], task["interval_unit"])
+    return task
+
+
+def get_enriched_task(task_id):
+    task = get_task(task_id)
+    return enrich_task(task) if task else None
+
+
 def get_history(limit=20):
     with connect_db() as conn:
         rows = conn.execute(
@@ -227,6 +251,21 @@ def get_history(limit=20):
             LIMIT ?
             """,
             (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_task_history(task_id, limit=50):
+    with connect_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT task_name, completed_on, next_due_on, created_at
+            FROM completion_history
+            WHERE task_id = ?
+            ORDER BY completed_on DESC, id DESC
+            LIMIT ?
+            """,
+            (task_id, limit),
         ).fetchall()
     return [dict(row) for row in rows]
 
@@ -253,6 +292,37 @@ def get_completion_count(days=30):
     return int(row["count"])
 
 
+def get_setting(key, default=""):
+    with connect_db() as conn:
+        row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key, value):
+    with connect_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO app_settings (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+
+
+def remember_ingress_base_path(base_path):
+    base_path = normalize_base_path(base_path)
+    if not base_path:
+        return
+    if get_setting("ingress_base_path") != base_path:
+        set_setting("ingress_base_path", base_path)
+        request_homeassistant_sync()
+
+
+def get_ingress_base_path():
+    return normalize_base_path(get_setting("ingress_base_path", ""))
+
+
 def summarize(tasks):
     counts = {"overdue": 0, "due_today": 0, "upcoming": 0}
     upcoming_window = 0
@@ -276,22 +346,29 @@ def summarize(tasks):
     }
 
 
-def homeassistant_task_row(task):
+def homeassistant_task_row(task, base_path=""):
+    detail_path = f"/item/{task['id']}"
     return {
+        "id": task["id"],
         "name": task["name"],
         "category": task["category"],
         "status": task["status_label"],
+        "status_key": task["status"],
+        "is_overdue": task["status"] == "overdue",
         "due_date": task["next_due_on"],
         "due_phrase": task["due_phrase"],
         "days_until": task["days_until"],
         "last_done": task["last_completed_on"] or "Never",
         "repeat": task["recurrence_phrase"],
+        "detail_path": detail_path,
+        "detail_url": homeassistant_link(detail_path, base_path),
     }
 
 
 def homeassistant_state_payloads(tasks=None):
     tasks = tasks if tasks is not None else get_tasks()
     summary = summarize(tasks)
+    ingress_base_path = get_ingress_base_path()
     overdue = [task for task in tasks if task["status"] == "overdue"]
     due_today = [task for task in tasks if task["status"] == "due_today"]
     upcoming_window = [
@@ -299,8 +376,14 @@ def homeassistant_state_payloads(tasks=None):
         for task in tasks
         if task["status"] == "upcoming" and task["days_until"] <= UPCOMING_WINDOW_DAYS
     ]
+    dashboard_tasks = [
+        task
+        for task in tasks
+        if task["status"] in {"overdue", "due_today"} or task["days_until"] <= HOMEASSISTANT_DASHBOARD_WINDOW_DAYS
+    ]
     ready = overdue + due_today
-    all_items = [homeassistant_task_row(task) for task in tasks]
+    all_items = [homeassistant_task_row(task, ingress_base_path) for task in tasks]
+    dashboard_items = [homeassistant_task_row(task, ingress_base_path) for task in dashboard_tasks]
     updated_at = utc_now_iso()
 
     def count_payload(name, state, icon, items):
@@ -310,8 +393,10 @@ def homeassistant_state_payloads(tasks=None):
                 "friendly_name": name,
                 "icon": icon,
                 "unit_of_measurement": "items",
-                "items": [homeassistant_task_row(task) for task in items],
+                "items": [homeassistant_task_row(task, ingress_base_path) for task in items],
                 "item_count": len(items),
+                "dashboard_url": homeassistant_link("/focus", ingress_base_path),
+                "ingress_base_path": ingress_base_path,
                 "updated_at": updated_at,
             },
         }
@@ -332,6 +417,20 @@ def homeassistant_state_payloads(tasks=None):
         f"sensor.{HOMEASSISTANT_ENTITY_PREFIX}_ready": count_payload(
             "MxTracker Ready", summary["ready_count"], "mdi:format-list-checks", ready
         ),
+        f"sensor.{HOMEASSISTANT_ENTITY_PREFIX}_due_14_days": {
+            "state": str(len(dashboard_items)),
+            "attributes": {
+                "friendly_name": "MxTracker Due Next 14 Days",
+                "icon": "mdi:calendar-alert",
+                "unit_of_measurement": "items",
+                "items": dashboard_items,
+                "item_count": len(dashboard_items),
+                "window_days": HOMEASSISTANT_DASHBOARD_WINDOW_DAYS,
+                "dashboard_url": homeassistant_link("/focus", ingress_base_path),
+                "ingress_base_path": ingress_base_path,
+                "updated_at": updated_at,
+            },
+        },
         f"sensor.{HOMEASSISTANT_ENTITY_PREFIX}_all_items": {
             "state": str(summary["total"]),
             "attributes": {
@@ -340,6 +439,8 @@ def homeassistant_state_payloads(tasks=None):
                 "unit_of_measurement": "items",
                 "items": all_items,
                 "item_count": len(all_items),
+                "dashboard_url": homeassistant_link("/items", ingress_base_path),
+                "ingress_base_path": ingress_base_path,
                 "updated_at": updated_at,
             },
         },
@@ -392,7 +493,11 @@ def csv_cell(value):
 
 
 def safe_return_path(value):
-    return value if value in {"/", "/items"} else "/"
+    if value in {"/", "/items", "/focus"}:
+        return value
+    if value.startswith("/item/") and value.removeprefix("/item/").isdigit():
+        return value
+    return "/"
 
 
 def safe_theme(value):
@@ -410,6 +515,11 @@ def app_url(path, base_path=""):
     return f"{normalize_base_path(base_path)}{path}"
 
 
+def homeassistant_link(path, base_path=""):
+    base_path = normalize_base_path(base_path) or get_ingress_base_path()
+    return app_url(path, base_path) if base_path else app_url(path)
+
+
 def safe_referer_path(value, base_path=""):
     if not value:
         return "/"
@@ -418,7 +528,7 @@ def safe_referer_path(value, base_path=""):
     base_path = normalize_base_path(base_path)
     if base_path and path.startswith(base_path):
         path = path.removeprefix(base_path) or "/"
-    if path not in {"/", "/items", "/new"} and not path.startswith("/edit/"):
+    if path not in {"/", "/items", "/new", "/focus"} and not path.startswith(("/edit/", "/item/")):
         return "/"
     return path
 
@@ -907,6 +1017,57 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
     .errors {{ color: var(--danger); }}
     .history-item {{ padding: 10px 0; border-top: 1px solid var(--line); }}
     .history-item:first-child {{ border-top: 0; }}
+    .focus-list {{
+      display: grid;
+      gap: 12px;
+    }}
+    .focus-item {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+      color: var(--text);
+      text-decoration: none;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+    }}
+    .focus-item.overdue {{
+      border-color: var(--danger);
+      background: var(--danger-bg);
+    }}
+    .focus-item.overdue strong,
+    .detail-hero.overdue h2 {{
+      color: var(--danger);
+    }}
+    .focus-meta {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 6px;
+    }}
+    .detail-grid {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin: 16px 0;
+    }}
+    .detail-field {{
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-strong);
+    }}
+    .detail-field span {{
+      display: block;
+      color: var(--muted);
+      font-size: .78rem;
+      font-weight: 900;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+      margin-bottom: 4px;
+    }}
     .table-panel {{ margin-bottom: 18px; overflow: hidden; }}
     .table-panel.overdue-section {{
       border-color: var(--danger);
@@ -980,6 +1141,7 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
       .theme-switch {{ width: 100%; }}
       .theme-link {{ flex: 1; text-align: center; }}
       .table-head {{ flex-direction: column; }}
+      .detail-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .task-table, .task-table tbody, .task-table tr, .task-table td {{ display: block; width: 100%; max-width: 100%; }}
       .task-table thead {{ display: none; }}
       .task-table .col-name,
@@ -1038,6 +1200,8 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
       nav .button {{ flex: 1; }}
       .audit-actions .button {{ width: 100%; }}
       .quick-actions {{ grid-template-columns: 1fr; }}
+      .focus-item {{ grid-template-columns: 1fr; }}
+      .detail-grid {{ grid-template-columns: 1fr; }}
     }}
   </style>
 </head>
@@ -1109,7 +1273,7 @@ def render_dashboard(csrf_token, notice="", theme="system", base_path=""):
                 f"""
                 <tr>
                   <td data-label="Task" class="col-name">
-                    <strong>{escape(task["name"])}</strong>
+                    <strong><a href="{app_url(f"/item/{task_id}", base_path)}">{escape(task["name"])}</a></strong>
                     {notes}
                     <div class="meta">Last done {last_done}</div>
                   </td>
@@ -1196,6 +1360,50 @@ def render_dashboard(csrf_token, notice="", theme="system", base_path=""):
     return render_layout("Home Maintenance", body, csrf_token, notice, theme, base_path)
 
 
+def render_focus_view(csrf_token, notice="", theme="system", base_path=""):
+    tasks = [
+        task
+        for task in get_tasks()
+        if task["status"] in {"overdue", "due_today"} or task["days_until"] <= HOMEASSISTANT_DASHBOARD_WINDOW_DAYS
+    ]
+    if tasks:
+        items = []
+        for task in tasks:
+            status_class = " overdue" if task["status"] == "overdue" else ""
+            items.append(
+                f"""
+                <a class="focus-item{status_class}" href="{app_url(f"/item/{task["id"]}", base_path)}">
+                  <div>
+                    <strong>{escape(task["name"])}</strong>
+                    <div class="focus-meta">
+                      <span class="badge {task["status"]}">{escape(task["due_phrase"])}</span>
+                      <span class="meta">{escape(task["category"])}</span>
+                      <span class="meta">Last done {escape(task["last_completed_on"] or "Never")}</span>
+                    </div>
+                  </div>
+                  <div class="meta">{escape(task["next_due_on"])}</div>
+                </a>
+                """
+            )
+        content = "".join(items)
+    else:
+        content = '<div class="empty">Nothing is due in the next 14 days.</div>'
+
+    body = f"""
+      <section class="panel">
+        <div class="table-head">
+          <div>
+            <h2>Due Next 14 Days</h2>
+            <div class="meta">Overdue items stay visible until completed or snoozed.</div>
+          </div>
+          <a class="button secondary" href="{app_url("/", base_path)}">Open dashboard</a>
+        </div>
+        <div class="focus-list">{content}</div>
+      </section>
+    """
+    return render_layout("Maintenance Due Soon", body, csrf_token, notice, theme, base_path)
+
+
 def render_items_audit(csrf_token, notice="", theme="system", base_path=""):
     tasks = get_tasks()
     if tasks:
@@ -1209,7 +1417,7 @@ def render_items_audit(csrf_token, notice="", theme="system", base_path=""):
                 f"""
                 <tr>
                   <td data-label="Task" class="col-name">
-                    <strong>{escape(task["name"])}</strong>
+                    <strong><a href="{app_url(f"/item/{task_id}", base_path)}">{escape(task["name"])}</a></strong>
                     {notes}
                   </td>
                   <td data-label="Category" class="col-category">{escape(task["category"])}</td>
@@ -1264,6 +1472,84 @@ def render_items_audit(csrf_token, notice="", theme="system", base_path=""):
       </section>
     """
     return render_layout("All Maintenance Items", body, csrf_token, notice, theme, base_path)
+
+
+def render_item_detail(task, csrf_token, notice="", theme="system", base_path=""):
+    history = get_task_history(task["id"])
+    status_class = " overdue" if task["status"] == "overdue" else ""
+    complete_url = app_url(f"/complete/{task['id']}", base_path)
+    snooze_url = app_url(f"/snooze/{task['id']}", base_path)
+    edit_url = app_url(f"/edit/{task['id']}", base_path)
+    delete_url = f'{app_url(f"/delete/{task["id"]}", base_path)}?return_to={quote(f"/item/{task["id"]}", safe="")}'
+    return_to = f"/item/{task['id']}"
+
+    if history:
+        history_rows = []
+        for item in history:
+            history_rows.append(
+                f"""
+                <tr>
+                  <td data-label="Completed">{escape(item["completed_on"])}</td>
+                  <td data-label="Next due">{escape(item["next_due_on"])}</td>
+                  <td data-label="Recorded">{escape(item["created_at"])}</td>
+                </tr>
+                """
+            )
+        history_body = "".join(history_rows)
+    else:
+        history_body = '<tr><td colspan="3" class="empty">No completions recorded yet.</td></tr>'
+
+    notes = f'<p class="notes">{escape(task["notes"])}</p>' if task["notes"] else '<p class="empty">No notes saved for this item.</p>'
+    body = f"""
+      <section class="panel detail-hero{status_class}">
+        <div class="table-head">
+          <div>
+            <h2>{escape(task["name"])}</h2>
+            <div class="meta">{escape(task["category"])}</div>
+          </div>
+          <span class="badge {task["status"]}">{escape(task["due_phrase"])}</span>
+        </div>
+        <div class="detail-grid">
+          <div class="detail-field"><span>Next due</span>{escape(task["next_due_on"])}</div>
+          <div class="detail-field"><span>Last done</span>{escape(task["last_completed_on"] or "Never")}</div>
+          <div class="detail-field"><span>Repeat</span>{escape(task["recurrence_phrase"])}</div>
+          <div class="detail-field"><span>Status</span>{escape(task["status_label"])}</div>
+        </div>
+        <h2>Details</h2>
+        {notes}
+        <div class="actions form-actions">
+          <form class="inline" action="{complete_url}" method="post">
+            <input type="hidden" name="csrf_token" value="{csrf_token}">
+            <input type="hidden" name="return_to" value="{escape(return_to)}">
+            <button type="submit">Mark done</button>
+          </form>
+          <form class="inline" action="{snooze_url}" method="post">
+            <input type="hidden" name="csrf_token" value="{csrf_token}">
+            <input type="hidden" name="return_to" value="{escape(return_to)}">
+            <button class="secondary" type="submit">Snooze 7d</button>
+          </form>
+          <a class="button secondary" href="{edit_url}">Edit</a>
+          <a class="button danger" href="{delete_url}">Delete</a>
+        </div>
+      </section>
+      <section class="panel table-panel">
+        <div class="table-head">
+          <h2>Completion History</h2>
+          <div class="meta">Most recent first</div>
+        </div>
+        <table class="task-table">
+          <thead>
+            <tr>
+              <th>Completed</th>
+              <th>Next due after completion</th>
+              <th>Recorded</th>
+            </tr>
+          </thead>
+          <tbody>{history_body}</tbody>
+        </table>
+      </section>
+    """
+    return render_layout(task["name"], body, csrf_token, notice, theme, base_path)
 
 
 def render_task_form(csrf_token, task=None, errors=None, theme="system", base_path=""):
@@ -1367,6 +1653,7 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
         csrf = self.get_or_create_csrf_token()
         theme = self.current_theme()
         base_path = self.base_path()
+        remember_ingress_base_path(base_path)
         if parsed.path.startswith("/theme/"):
             requested = parsed.path.removeprefix("/theme/").strip("/")
             return_to = safe_referer_path(self.headers.get("Referer", "/"), base_path)
@@ -1379,6 +1666,19 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
         if parsed.path == "/items":
             notice = parse_qs(parsed.query).get("notice", [""])[0]
             self.respond_html(render_items_audit(csrf, notice=notice, theme=theme, base_path=base_path), csrf)
+            return
+        if parsed.path == "/focus":
+            notice = parse_qs(parsed.query).get("notice", [""])[0]
+            self.respond_html(render_focus_view(csrf, notice=notice, theme=theme, base_path=base_path), csrf)
+            return
+        if parsed.path.startswith("/item/"):
+            task_id = self.extract_id(parsed.path, "/item/")
+            task = get_enriched_task(task_id) if task_id else None
+            if not task:
+                self.redirect("/", "Item not found.")
+                return
+            notice = parse_qs(parsed.query).get("notice", [""])[0]
+            self.respond_html(render_item_detail(task, csrf, notice=notice, theme=theme, base_path=base_path), csrf)
             return
         if parsed.path == "/new":
             self.respond_html(render_task_form(csrf, theme=theme, base_path=base_path), csrf)

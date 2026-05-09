@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2
+
+- Added a 14-day Home Assistant dashboard sensor for overdue, current, and near-term maintenance.
+- Added clickable detail links in Home Assistant sensor attributes.
+- Added a focused due-soon page and per-item detail pages with completion history.
+
 ## 0.1.1
 
 - Added Home Assistant sensor publishing for dashboard cards and maintenance audit tables.
