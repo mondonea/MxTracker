@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.8
+
+- Added a House todos module for one-off repair projects alongside recurring maintenance.
+- Added priority scoring based on likelihood, consequence, urgency, effort, and cost.
+- Added a risk map, mobile-friendly todo list, todo detail pages, and nested checklist planning.
+- Added start-gate checklist items that roll up into ready-to-start status and progress.
+- Added a Home Assistant sensor and read-only API endpoint for active house todos.
+- Added optional demo data seeding for fresh test databases.
+- Added unit coverage for todo scoring, readiness, dashboard rendering, detail rendering, and sensor payloads.
+
+## 0.1.7
+
+- Added a monthly calendar view for maintenance due dates.
+- Added cached Home Assistant area sync and per-item area assignment.
+- Added Home Assistant area metadata to item APIs, CSV export, and sensor payloads.
+- Moved delete access off the dashboard and kept it on item detail pages.
+- Highlighted the active top navigation view.
+- Removed overdue red panel styling when there are no overdue items.
+- Closed SQLite connections after each transaction to reduce long-running resource use.
+- Added unit coverage for calendar rendering, delete visibility, active navigation, area sync, area validation, sensor payloads, and database migrations.
+
 ## 0.1.6
 
 - Expanded item detail pages with category, status, due timing, completion count, created date, and updated date.
