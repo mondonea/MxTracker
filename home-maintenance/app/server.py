@@ -2459,6 +2459,18 @@ def delete_task(task_id):
         record_task_event(task_id, task["name"], "deleted", {"name": task["name"]})
 
 
+def trash_icon():
+    return """
+      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path d="M9 3h6l1 2h4v2H4V5h4l1-2Zm1 7h2v8h-2v-8Zm4 0h2v8h-2v-8ZM7 8h10l-1 13H8L7 8Z"></path>
+      </svg>
+    """
+
+
+def delete_confirmed(fields):
+    return fields.get("confirm_text", "").strip() == "DELETE"
+
+
 def render_layout(title, body, csrf_token, notice="", theme="system", base_path="", active_view=""):
     theme = theme if theme in THEMES else "system"
     base_path = normalize_base_path(base_path)
@@ -2466,24 +2478,39 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
     for mode in ["system", "light", "dark"]:
         active = " active" if theme == mode else ""
         theme_links.append(f'<a class="theme-link{active}" href="{app_url(f"/theme/{mode}", base_path)}">{mode.title()}</a>')
-    nav_items = [
-        ("today", "Today", "/"),
-        ("soon", "Soon", "/focus"),
-        ("audit", "Audit", "/items"),
-        ("calendar", "Calendar", "/calendar"),
-        ("reports", "Reports", "/reports"),
-        ("todos", "House todos", "/todos"),
-        ("ha_setup", "HA setup", "/ha-setup"),
-        ("new", "Add item", "/new"),
+    nav_groups = [
+        (
+            "Maintenance",
+            [
+                ("dashboard", "Dashboard", "/"),
+                ("soon", "Soon", "/focus"),
+                ("audit", "Audit", "/items"),
+                ("calendar", "Calendar", "/calendar"),
+                ("reports", "Reports", "/reports"),
+                ("new", "Add maintenance", "/new"),
+            ],
+        ),
+        ("Projects", [("todos", "House todos", "/todos")]),
+        ("System", [("ha_setup", "HA setup", "/ha-setup")]),
     ]
-    nav_links = []
-    for key, label, path in nav_items:
-        active = key == active_view
-        classes = "button nav-link" if key == "new" else "button secondary nav-link"
-        if active:
-            classes += " active"
-        aria_current = ' aria-current="page"' if active else ""
-        nav_links.append(f'<a class="{classes}" href="{app_url(path, base_path)}"{aria_current}>{label}</a>')
+    nav_groups_html = []
+    for group_label, items in nav_groups:
+        nav_links = []
+        for key, label, path in items:
+            active = key == active_view
+            classes = "button nav-link" if key == "new" else "button secondary nav-link"
+            if active:
+                classes += " active"
+            aria_current = ' aria-current="page"' if active else ""
+            nav_links.append(f'<a class="{classes}" href="{app_url(path, base_path)}"{aria_current}>{label}</a>')
+        nav_groups_html.append(
+            f"""
+            <div class="nav-group">
+              <span class="nav-label">{escape(group_label)}</span>
+              <div class="nav-links">{''.join(nav_links)}</div>
+            </div>
+            """
+        )
     return f"""<!doctype html>
 <html lang="en" data-theme="{escape(theme)}">
 <head>
@@ -2563,6 +2590,13 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
       font-size: .9rem;
       line-height: 1.45;
     }}
+    .icon {{
+      width: 18px;
+      height: 18px;
+      display: inline-block;
+      fill: currentColor;
+      flex: 0 0 auto;
+    }}
     .wrap {{ width: min(1120px, calc(100% - 32px)); margin: 0 auto; }}
     header {{
       border-bottom: 1px solid var(--line);
@@ -2571,14 +2605,40 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
     .topbar {{
       min-height: 76px;
       display: flex;
-      align-items: center;
+      align-items: flex-start;
       justify-content: space-between;
       gap: 16px;
+      padding: 18px 0;
     }}
     h1 {{ margin: 0; font-size: clamp(1.5rem, 2vw, 2.15rem); letter-spacing: 0; }}
     h2 {{ margin: 0 0 14px; font-size: 1.1rem; letter-spacing: 0; }}
     main {{ padding: 24px 0 42px; }}
     .actions {{ display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }}
+    .primary-nav {{
+      display: flex;
+      align-items: flex-start;
+      justify-content: flex-end;
+      gap: 14px;
+      flex-wrap: wrap;
+    }}
+    .nav-group {{
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+    }}
+    .nav-label {{
+      color: var(--muted);
+      font-size: .72rem;
+      font-weight: 900;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+    }}
+    .nav-links {{
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }}
     .form-actions {{ margin-top: 16px; }}
     .confirm-card {{ box-shadow: none; }}
     .theme-switch {{
@@ -2632,6 +2692,10 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
       border-color: var(--danger);
       background: var(--danger);
       color: #fff;
+    }}
+    .button.confirm-danger, button.confirm-danger {{
+      min-height: 46px;
+      font-weight: 900;
     }}
     .grid {{
       display: grid;
@@ -2712,6 +2776,23 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
       width: auto;
       min-height: auto;
       margin-right: 8px;
+    }}
+    details.advanced-panel {{
+      margin-top: 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-strong);
+      padding: 0;
+      overflow: hidden;
+    }}
+    details.advanced-panel summary {{
+      cursor: pointer;
+      padding: 12px 14px;
+      font-weight: 900;
+    }}
+    .advanced-content {{
+      padding: 0 14px 14px;
+      border-top: 1px solid var(--line);
     }}
     textarea {{ min-height: 120px; resize: vertical; }}
     .form-row {{
@@ -2865,6 +2946,14 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
       margin-bottom: 4px;
     }}
     .table-panel {{ margin-bottom: 18px; overflow: hidden; }}
+    .table-scroll {{
+      width: 100%;
+      overflow-x: auto;
+    }}
+    .audit-table {{
+      min-width: 1040px;
+      table-layout: auto;
+    }}
     .table-panel.overdue-section {{
       border-color: var(--danger);
       background: var(--danger-bg);
@@ -2938,11 +3027,18 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
       font-size: .82rem;
       font-weight: 800;
     }}
-    .task-table .col-name {{ width: 31%; }}
-    .task-table .col-category {{ width: 14%; }}
-    .task-table .col-due {{ width: 18%; }}
-    .task-table .col-repeat {{ width: 15%; }}
-    .task-table .col-actions {{ width: 22%; }}
+    .task-table .col-name {{ width: 32%; }}
+    .task-table .col-category {{ width: 13%; }}
+    .task-table .col-due {{ width: 19%; }}
+    .task-table .col-repeat {{ width: 16%; }}
+    .task-table .col-actions {{ width: 20%; }}
+    .audit-table .col-name {{ width: 230px; }}
+    .audit-table .col-category {{ width: 120px; }}
+    .audit-table .col-area {{ width: 130px; }}
+    .audit-table .col-due {{ width: 150px; }}
+    .audit-table .col-date {{ width: 120px; }}
+    .audit-table .col-repeat {{ width: 130px; }}
+    .audit-table .col-actions {{ width: 170px; }}
     .quick-actions {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }}
     .quick-actions form {{ min-width: 0; }}
     .quick-actions .button, .quick-actions button {{ min-height: 34px; padding: 6px 9px; font-size: .9rem; }}
@@ -3122,6 +3218,8 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
       .grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .layout {{ grid-template-columns: 1fr; }}
       .topbar {{ align-items: flex-start; flex-direction: column; padding: 16px 0; }}
+      .primary-nav {{ justify-content: flex-start; width: 100%; }}
+      .nav-group {{ width: 100%; }}
       .wrap {{ width: min(100% - 22px, 1120px); }}
       .form-row {{ grid-template-columns: 1fr; }}
       .task-head {{ flex-direction: column; }}
@@ -3142,6 +3240,9 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
       .task-table .col-due,
       .task-table .col-repeat,
       .task-table .col-actions {{ width: 100%; }}
+      .task-table .col-area,
+      .task-table .col-date {{ width: 100%; }}
+      .audit-table {{ min-width: 0; }}
       .task-table tr {{
         border-top: 1px solid var(--line);
         padding: 14px 18px 16px;
@@ -3181,6 +3282,19 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
         font-weight: 800;
       }}
       .task-table td.col-category::before {{ content: ""; display: none; }}
+      .audit-table td.col-category {{
+        display: block;
+        width: 100%;
+        padding: 0;
+        border: 0;
+        border-radius: 0;
+        background: transparent;
+        font-weight: inherit;
+      }}
+      .audit-table td.col-category::before {{
+        content: attr(data-label);
+        display: block;
+      }}
       .task-table td.col-due .badge {{
         width: fit-content;
         max-width: 100%;
@@ -3191,6 +3305,7 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
       .grid {{ grid-template-columns: 1fr; }}
       .actions {{ width: 100%; }}
       nav .button {{ flex: 1; }}
+      .nav-links .button {{ flex: 1 1 calc(50% - 8px); }}
       .audit-actions .button {{ width: 100%; }}
       .quick-actions {{ grid-template-columns: 1fr; }}
       .focus-item {{ grid-template-columns: 1fr; }}
@@ -3231,8 +3346,8 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
         <h1>Home Maintenance</h1>
         <div class="meta">Private recurring task tracker</div>
       </div>
-      <nav class="actions">
-        {''.join(nav_links)}
+      <nav class="primary-nav" aria-label="Primary navigation">
+        {''.join(nav_groups_html)}
         <span class="theme-switch" aria-label="Theme mode">
           {''.join(theme_links)}
         </span>
@@ -3378,7 +3493,7 @@ def render_dashboard(csrf_token, notice="", theme="system", base_path=""):
         </aside>
       </section>
     """
-    return render_layout("Today", body, csrf_token, notice, theme, base_path, active_view="today")
+    return render_layout("Dashboard", body, csrf_token, notice, theme, base_path, active_view="dashboard")
 
 
 def render_root_page(query, csrf_token, notice="", theme="system", base_path=""):
@@ -3430,7 +3545,7 @@ def render_focus_view(csrf_token, notice="", theme="system", base_path=""):
             <h2>Due Next 14 Days</h2>
             <div class="meta">Overdue items stay visible until completed or snoozed.</div>
           </div>
-          <a class="button secondary" href="{app_url("/", base_path)}">Open today</a>
+          <a class="button secondary" href="{app_url("/", base_path)}">Open dashboard</a>
         </div>
         <div class="focus-list">{content}</div>
       </section>
@@ -3795,15 +3910,15 @@ def render_items_audit(csrf_token, query=None, notice="", theme="system", base_p
                     {notes}
                   </td>
                   <td data-label="Category" class="col-category">{escape(task["category"])}</td>
-                  <td data-label="Area">{escape(area_name)}</td>
+                  <td data-label="Area" class="col-area">{escape(area_name)}</td>
                   <td data-label="Status" class="col-due">
                     <span class="badge {task["status"]}">{escape(task["due_phrase"])}</span>
                     <div class="meta">{escape(task["status_label"])}</div>
                     {priority}
                   </td>
-                  <td data-label="Last done">{escape(task["last_completed_on"] or "Never")}</td>
-                  <td data-label="Next due">{escape(task["next_due_on"])}</td>
-                  <td data-label="Repeat">{escape(task["recurrence_phrase"])}</td>
+                  <td data-label="Last done" class="col-date">{escape(task["last_completed_on"] or "Never")}</td>
+                  <td data-label="Next due" class="col-date">{escape(task["next_due_on"])}</td>
+                  <td data-label="Repeat" class="col-repeat">{escape(task["recurrence_phrase"])}</td>
                   <td data-label="Actions" class="col-actions">
                     <div class="quick-actions">
                       <form class="inline" action="{complete_url}" method="post">
@@ -3880,21 +3995,23 @@ def render_items_audit(csrf_token, query=None, notice="", theme="system", base_p
           <h2>All Items</h2>
           <div class="meta">Audit every maintenance item at a glance</div>
         </div>
-        <table class="task-table">
+        <div class="table-scroll">
+        <table class="task-table audit-table">
           <thead>
             <tr>
               <th class="col-name">Task</th>
               <th class="col-category">Category</th>
-              <th>Area</th>
+              <th class="col-area">Area</th>
               <th class="col-due">Status</th>
-              <th>Last done</th>
-              <th>Next due</th>
-              <th>Repeat</th>
+              <th class="col-date">Last done</th>
+              <th class="col-date">Next due</th>
+              <th class="col-repeat">Repeat</th>
               <th class="col-actions">Actions</th>
             </tr>
           </thead>
           <tbody>{table_body}</tbody>
         </table>
+        </div>
       </section>
     """
     return render_layout("Maintenance Audit", body, csrf_token, notice, theme, base_path, active_view="audit")
@@ -4265,27 +4382,29 @@ def render_todo_form(csrf_token, todo=None, errors=None, theme="system", base_pa
     return render_layout(title, body, csrf_token, theme=theme, base_path=base_path, active_view="todos")
 
 
-def render_todo_delete_confirm(todo, csrf_token, return_to="/todos", theme="system", base_path=""):
+def render_todo_delete_confirm(todo, csrf_token, return_to="/todos", notice="", theme="system", base_path=""):
     delete_url = app_url(f"/todo/delete/{todo['id']}", base_path)
     body = f"""
       <section class="panel">
-        <h2>Delete House Todo</h2>
-        <p class="meta">This removes the one-off project and its checklist.</p>
+        <h2>{trash_icon()} Delete House Todo</h2>
+        <p class="meta">This removes the one-off project and its checklist. Type DELETE to confirm.</p>
         <div class="task confirm-card">
           <h3>{escape(todo["title"])}</h3>
           <div class="meta">{escape(todo.get("category") or "General")}</div>
         </div>
-        <div class="actions form-actions">
-          <form class="inline" action="{delete_url}" method="post">
-            <input type="hidden" name="csrf_token" value="{csrf_token}">
-            <input type="hidden" name="return_to" value="{escape(return_to)}">
-            <button class="danger" type="submit">Delete house todo</button>
-          </form>
-          <a class="button secondary" href="{app_url(return_to, base_path)}">Cancel</a>
-        </div>
+        <form action="{delete_url}" method="post">
+          <input type="hidden" name="csrf_token" value="{csrf_token}">
+          <input type="hidden" name="return_to" value="{escape(return_to)}">
+          <label for="confirm_text">Confirmation text</label>
+          <input id="confirm_text" name="confirm_text" autocomplete="off" required pattern="DELETE" placeholder="Type DELETE">
+          <div class="actions form-actions">
+            <button class="danger confirm-danger" type="submit">{trash_icon()} Delete house todo</button>
+            <a class="button secondary" href="{app_url(return_to, base_path)}">Cancel</a>
+          </div>
+        </form>
       </section>
     """
-    return render_layout("Delete House Todo", body, csrf_token, theme=theme, base_path=base_path, active_view="todos")
+    return render_layout("Delete House Todo", body, csrf_token, notice, theme=theme, base_path=base_path, active_view="todos")
 
 
 def render_task_form(csrf_token, task=None, errors=None, theme="system", base_path=""):
@@ -4316,7 +4435,7 @@ def render_task_form(csrf_token, task=None, errors=None, theme="system", base_pa
     values["ha_area_id"] = values.get("ha_area_id") or ""
     values["ha_area_name"] = values.get("ha_area_name") or ""
     action = app_url(f'/edit/{task["id"]}', base_path) if is_edit else app_url("/new", base_path)
-    title = "Edit Item" if is_edit else "Add Item"
+    title = "Edit Maintenance Item" if is_edit else "Add Maintenance Item"
     unit_options = []
     for unit in ["days", "weeks", "months", "years"]:
         selected = " selected" if values["interval_unit"] == unit else ""
@@ -4367,53 +4486,58 @@ def render_task_form(csrf_token, task=None, errors=None, theme="system", base_pa
               <input id="asset_name" name="asset_name" maxlength="120" value="{escape(values.get("asset_name", ""))}" placeholder="HVAC unit, dishwasher, gutters">
             </div>
             <div>
-              <label for="location">Location</label>
-              <input id="location" name="location" maxlength="120" value="{escape(values.get("location", ""))}" placeholder="Basement, kitchen, garage">
-            </div>
-          </div>
-          <div class="form-row">
-            <div>
-              <label for="model_number">Model number</label>
-              <input id="model_number" name="model_number" maxlength="120" value="{escape(values.get("model_number", ""))}">
-            </div>
-            <div>
-              <label for="serial_number">Serial number</label>
-              <input id="serial_number" name="serial_number" maxlength="120" value="{escape(values.get("serial_number", ""))}">
-            </div>
-          </div>
-          <div class="form-row">
-            <div>
-              <label for="filter_size">Filter or part size</label>
-              <input id="filter_size" name="filter_size" maxlength="80" value="{escape(values.get("filter_size", ""))}">
-            </div>
-            <div>
-              <label for="estimated_minutes">Estimated minutes</label>
-              <input id="estimated_minutes" name="estimated_minutes" type="number" min="0" max="10080" value="{escape(values.get("estimated_minutes", 0))}">
-            </div>
-          </div>
-          <div class="form-row">
-            <div>
-              <label for="purchase_date">Purchase date</label>
-              <input id="purchase_date" name="purchase_date" type="date" value="{escape(values.get("purchase_date", ""))}">
-            </div>
-            <div>
-              <label for="warranty_expires_on">Warranty expires</label>
-              <input id="warranty_expires_on" name="warranty_expires_on" type="date" value="{escape(values.get("warranty_expires_on", ""))}">
-            </div>
-          </div>
-          <div class="form-row">
-            <div>
               <label for="priority">Priority</label>
               <select id="priority" name="priority">{''.join(priority_options)}</select>
             </div>
+          </div>
+          <div class="form-row">
             <div>
               <label for="season">Season</label>
               <select id="season" name="season">{''.join(season_options)}</select>
             </div>
+            <div>
+              <label><input type="checkbox" name="requires_supplies" value="1"{checked_supplies}> Requires supplies</label>
+            </div>
           </div>
           <label for="tags">Tags</label>
           <input id="tags" name="tags" maxlength="200" value="{escape(values.get("tags", ""))}" placeholder="supplies, ladder, outside">
-          <label><input type="checkbox" name="requires_supplies" value="1"{checked_supplies}> Requires supplies</label>
+          <details class="advanced-panel">
+            <summary>Advanced asset details</summary>
+            <div class="advanced-content">
+              <div class="form-row">
+                <div>
+                  <label for="location">Location</label>
+                  <input id="location" name="location" maxlength="120" value="{escape(values.get("location", ""))}" placeholder="Basement, kitchen, garage">
+                </div>
+                <div>
+                  <label for="model_number">Model number</label>
+                  <input id="model_number" name="model_number" maxlength="120" value="{escape(values.get("model_number", ""))}">
+                </div>
+              </div>
+              <div class="form-row">
+                <div>
+                  <label for="serial_number">Serial number</label>
+                  <input id="serial_number" name="serial_number" maxlength="120" value="{escape(values.get("serial_number", ""))}">
+                </div>
+                <div>
+                  <label for="filter_size">Filter or part size</label>
+                  <input id="filter_size" name="filter_size" maxlength="80" value="{escape(values.get("filter_size", ""))}">
+                </div>
+              </div>
+              <div class="form-row">
+                <div>
+                  <label for="estimated_minutes">Estimated minutes</label>
+                  <input id="estimated_minutes" name="estimated_minutes" type="number" min="0" max="10080" value="{escape(values.get("estimated_minutes", 0))}">
+                </div>
+                <div>
+                  <label for="purchase_date">Purchase date</label>
+                  <input id="purchase_date" name="purchase_date" type="date" value="{escape(values.get("purchase_date", ""))}">
+                </div>
+              </div>
+              <label for="warranty_expires_on">Warranty expires</label>
+              <input id="warranty_expires_on" name="warranty_expires_on" type="date" value="{escape(values.get("warranty_expires_on", ""))}">
+            </div>
+          </details>
           <label for="notes">Notes</label>
           <textarea id="notes" name="notes" maxlength="1000">{escape(values["notes"])}</textarea>
           <div class="form-row">
@@ -4429,7 +4553,7 @@ def render_task_form(csrf_token, task=None, errors=None, theme="system", base_pa
           <label for="next_due_on">Next due</label>
           <input id="next_due_on" name="next_due_on" type="date" required value="{escape(values["next_due_on"])}">
           <div class="actions form-actions">
-            <button type="submit">Save item</button>
+            <button type="submit">Save maintenance item</button>
             <a class="button secondary" href="{app_url("/", base_path)}">Cancel</a>
           </div>
         </form>
@@ -4438,29 +4562,31 @@ def render_task_form(csrf_token, task=None, errors=None, theme="system", base_pa
     return render_layout(title, body, csrf_token, theme=theme, base_path=base_path, active_view="new" if not is_edit else "audit")
 
 
-def render_delete_confirm(task, csrf_token, return_to="/", theme="system", base_path=""):
+def render_delete_confirm(task, csrf_token, return_to="/", notice="", theme="system", base_path=""):
     delete_url = app_url(f"/delete/{task['id']}", base_path)
     recurrence = recurrence_phrase(task["interval_count"], task["interval_unit"])
     category = task.get("category") or "General"
     body = f"""
       <section class="panel">
-        <h2>Delete Item</h2>
-        <p class="meta">This removes the maintenance item and its future schedule.</p>
+        <h2>{trash_icon()} Delete Maintenance Item</h2>
+        <p class="meta">This removes the maintenance item, future schedule, checklist, and history. Type DELETE to confirm.</p>
         <div class="task confirm-card">
           <h3>{escape(task["name"])}</h3>
           <div class="meta">{escape(category)} - {escape(recurrence)}</div>
         </div>
-        <div class="actions form-actions">
-          <form class="inline" action="{delete_url}" method="post">
-            <input type="hidden" name="csrf_token" value="{csrf_token}">
-            <input type="hidden" name="return_to" value="{escape(return_to)}">
-            <button class="danger" type="submit">Delete item</button>
-          </form>
-          <a class="button secondary" href="{app_url(return_to, base_path)}">Cancel</a>
-        </div>
+        <form action="{delete_url}" method="post">
+          <input type="hidden" name="csrf_token" value="{csrf_token}">
+          <input type="hidden" name="return_to" value="{escape(return_to)}">
+          <label for="confirm_text">Confirmation text</label>
+          <input id="confirm_text" name="confirm_text" autocomplete="off" required pattern="DELETE" placeholder="Type DELETE">
+          <div class="actions form-actions">
+            <button class="danger confirm-danger" type="submit">{trash_icon()} Delete maintenance item</button>
+            <a class="button secondary" href="{app_url(return_to, base_path)}">Cancel</a>
+          </div>
+        </form>
       </section>
     """
-    return render_layout("Delete Maintenance Item", body, csrf_token, theme=theme, base_path=base_path, active_view="audit")
+    return render_layout("Delete Maintenance Item", body, csrf_token, notice, theme=theme, base_path=base_path, active_view="audit")
 
 
 class MaintenanceHandler(BaseHTTPRequestHandler):
@@ -4517,8 +4643,10 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
             if not todo:
                 self.redirect("/todos", "House todo not found.")
                 return
-            return_to = safe_return_path(parse_qs(parsed.query).get("return_to", ["/todos"])[0])
-            self.respond_html(render_todo_delete_confirm(todo, csrf, return_to, theme=theme, base_path=base_path), csrf)
+            query = parse_qs(parsed.query)
+            return_to = safe_return_path(query.get("return_to", ["/todos"])[0])
+            notice = query.get("notice", [""])[0]
+            self.respond_html(render_todo_delete_confirm(todo, csrf, return_to, notice=notice, theme=theme, base_path=base_path), csrf)
             return
         if parsed.path.startswith("/todo/"):
             project_id = self.extract_id(parsed.path, "/todo/")
@@ -4573,8 +4701,10 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
             if not task:
                 self.redirect("/", "Item not found.")
                 return
-            return_to = safe_return_path(parse_qs(parsed.query).get("return_to", ["/"])[0])
-            self.respond_html(render_delete_confirm(task, csrf, return_to, theme=theme, base_path=base_path), csrf)
+            query = parse_qs(parsed.query)
+            return_to = safe_return_path(query.get("return_to", ["/"])[0])
+            notice = query.get("notice", [""])[0]
+            self.respond_html(render_delete_confirm(task, csrf, return_to, notice=notice, theme=theme, base_path=base_path), csrf)
             return
         if parsed.path == "/api/summary":
             self.respond_json(summarize(get_tasks()))
@@ -4730,6 +4860,10 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/todo/delete/"):
             project_id = self.extract_id(parsed.path, "/todo/delete/")
             return_to = safe_return_path(fields.get("return_to", "/todos"))
+            if not delete_confirmed(fields):
+                confirm_path = f"/todo/delete/{project_id}?return_to={quote(return_to, safe='')}" if project_id else "/todos"
+                self.redirect(confirm_path, "Type DELETE to confirm deletion.")
+                return
             if project_id:
                 delete_todo(project_id)
             self.redirect(return_to if return_to != f"/todo/{project_id}" else "/todos", "House todo deleted.")
@@ -4767,9 +4901,13 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/delete/"):
             task_id = self.extract_id(parsed.path, "/delete/")
             return_to = safe_return_path(fields.get("return_to", "/"))
+            if not delete_confirmed(fields):
+                confirm_path = f"/delete/{task_id}?return_to={quote(return_to, safe='')}" if task_id else "/"
+                self.redirect(confirm_path, "Type DELETE to confirm deletion.")
+                return
             if task_id:
                 delete_task(task_id)
-            self.redirect(return_to, "Maintenance item deleted.")
+            self.redirect(return_to if return_to != f"/item/{task_id}" else "/items", "Maintenance item deleted.")
             return
         self.respond_not_found()
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.0.1
+
+- Grouped navigation into Maintenance, Projects, and System sections so recurring maintenance and House todos have clearer workflows.
+- Renamed the root view to Dashboard and kept Add maintenance separate from Add house todo.
+- Moved detailed asset fields into a collapsed Advanced asset details panel on maintenance forms.
+- Improved the maintenance audit table spacing and mobile label behavior.
+- Added typed DELETE confirmation and a trash affordance before deleting maintenance items or House todos.
+
 ## 2.0.0
 
 - Expanded recurring maintenance items with asset, location, model, serial, filter/part size, purchase date, warranty date, priority, season, tags, supplies, and estimated-time fields.

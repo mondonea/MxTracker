@@ -208,6 +208,7 @@ class MaintenanceServerTests(unittest.TestCase):
 
         html = server.render_dashboard("csrf-token")
 
+        self.assertIn("<title>Dashboard</title>", html)
         self.assertIn("Nothing overdue", html)
         self.assertNotIn('<section class="panel table-panel overdue-section">', html)
         self.assertNotIn('href="/delete/', html)
@@ -251,8 +252,10 @@ class MaintenanceServerTests(unittest.TestCase):
         html = server.render_items_audit("csrf-token")
 
         self.assertIn('class="button secondary nav-link active" href="/items" aria-current="page"', html)
-        self.assertIn("<th>Area</th>", html)
-        self.assertIn("<td data-label=\"Area\">Kitchen</td>", html)
+        self.assertIn('<div class="table-scroll">', html)
+        self.assertIn('<table class="task-table audit-table">', html)
+        self.assertIn('<th class="col-area">Area</th>', html)
+        self.assertIn('<td data-label="Area" class="col-area">Kitchen</td>', html)
 
     def test_all_items_filters_search_status_category_and_area(self):
         today = date.today()
@@ -460,6 +463,23 @@ class MaintenanceServerTests(unittest.TestCase):
         self.assertIn("Replace sparking outlet", html)
         self.assertIn("Patch paint chip", html)
         self.assertIn('href="/todo/new"', html)
+
+    def test_delete_confirmation_requires_exact_text_and_uses_trash_affordance(self):
+        today = date.today()
+        self.add_task("Replace HVAC filter", today, "HVAC")
+        task = server.get_task(1)
+        self.assertFalse(server.delete_confirmed({"confirm_text": ""}))
+        self.assertFalse(server.delete_confirmed({"confirm_text": "delete"}))
+        self.assertTrue(server.delete_confirmed({"confirm_text": "DELETE"}))
+
+        html = server.render_delete_confirm(task, "csrf-token", return_to="/item/1", notice="Type DELETE to confirm deletion.")
+
+        self.assertIn("Delete Maintenance Item", html)
+        self.assertIn("Type DELETE to confirm deletion.", html)
+        self.assertIn('name="confirm_text"', html)
+        self.assertIn('required pattern="DELETE"', html)
+        self.assertIn('class="danger confirm-danger"', html)
+        self.assertIn("Delete maintenance item", html)
 
     def test_house_todo_filters_keep_default_active_view_and_allow_done_audit(self):
         server.save_todo(

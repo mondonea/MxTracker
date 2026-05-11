@@ -1,5 +1,5 @@
 name: Home Maintenance Tracker
-version: "2.0.0"
+version: "2.0.1"
 slug: home_maintenance
 description: Track recurring maintenance and house repair todos from inside Home Assistant.
 url: https://github.com/mondonea/MxTracker
