@@ -1,5 +1,25 @@
 # Changelog
 
+## 2.0.0
+
+- Expanded recurring maintenance items with asset, location, model, serial, filter/part size, purchase date, warranty date, priority, season, tags, supplies, and estimated-time fields.
+- Added reusable per-item maintenance checklists with add, toggle, remove, and automatic reset after completion.
+- Added annual reports with completion trends, overdue counts, due-next-14 counts, never-completed counts, supplies counts, and recent annual history.
+- Added token-protected Home Assistant action endpoints for marking maintenance done, snoozing, and resolving detail links.
+- Added a Home Assistant setup page with generated secret, `rest_command`, and actionable notification examples.
+- Added lifecycle event recording and per-item lifecycle timelines.
+- Added read-only annual report, backup health, and Home Assistant setup-example API endpoints.
+- Added richer CSV exports with asset, completion, and lifecycle fields.
+- Added unit coverage for 2.0 migrations, checklist lifecycle behavior, reports, backup health, lifecycle events, CSV output, and action API validation.
+
+## 0.1.9
+
+- Added search and filters to the All items maintenance audit view.
+- Added House todos filters for active/all status, category, risk band, area, and search.
+- Added dashboard shortcuts for the due-next-14-days focus view and calendar.
+- Added stricter browser security headers for camera, microphone, geolocation, and same-origin framing.
+- Added unit coverage for maintenance filters, House todo filters, and security headers.
+
 ## 0.1.8
 
 - Added a House todos module for one-off repair projects alongside recurring maintenance.

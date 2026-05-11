@@ -8,21 +8,30 @@ Track recurring home maintenance tasks and one-off house repair todos from insid
 - Add, edit, and delete one-off house todos such as leaks, broken fixtures, and repair projects.
 - Mark tasks complete.
 - Track overdue, due today, upcoming, and later items.
+- Track maintenance by asset, location, Home Assistant area, model, serial number, filter size, purchase date, warranty date, priority, season, tags, supplies, and estimated time.
+- Use reusable per-item maintenance checklists for repeatable steps.
+- Search and filter maintenance items by text, category, status, due-next-14-days, completion state, and Home Assistant area.
 - View dashboard metrics for overdue work, current work, upcoming work, on-track percentage, and recent completions.
 - Open a focused 14-day dashboard view for overdue, current, and near-term work.
 - View maintenance due dates in a monthly calendar.
+- Review annual reports with completion trends, never-completed items, supplies counts, and recent annual history.
+- Review lifecycle events for create, edit, complete, snooze, checklist, and delete activity.
 - Click into each maintenance item to review details, actions, and completion history.
 - Audit a full list of maintenance items with last completed and next due dates.
 - Export maintenance items and completion history to CSV.
+- Export lifecycle events to CSV.
 - Group tasks into practical home categories such as HVAC, Appliances, Exterior, Yard, and Safety.
 - Link maintenance items to Home Assistant areas synced from your existing Home Assistant setup.
 - Rank house todos with a likelihood x consequence risk map, urgency, effort, cost, readiness, and progress.
+- Search and filter house todos by text, category, active or done status, risk band, and Home Assistant area.
 - Use house todo detail pages with nested checklist steps and start-gate checkboxes that roll up into ready/in-work progress.
 - Snooze a task for 7 days when it needs to move out of today's work.
 - Switch between System, Light, and Dark themes from inside the app.
 - Use mobile-friendly card views inside Home Assistant on a phone.
 - Store task history locally.
 - Publish Home Assistant sensors for summary cards and maintenance table attributes.
+- Use token-protected Home Assistant action endpoints for automations that mark done, snooze, or open detail links.
+- Open a built-in Home Assistant setup page with `rest_command`, secret, and actionable notification examples.
 - Provide read-only JSON API endpoints for local integrations and troubleshooting.
 
 ## Privacy
@@ -57,6 +66,7 @@ The add-on is configured for Home Assistant-first use:
 - Optional demo data seeding for a fresh test database.
 - Home Assistant sensors for dashboard cards and maintenance audit tables.
 - Cached Home Assistant area names for assigning maintenance items to rooms or areas.
+- Optional API action token for Home Assistant automations.
 
 ## Dashboard
 
@@ -72,6 +82,8 @@ Each row shows the category, due timing, recurrence, last completion date, linke
 ## House Todos
 
 The **House todos** view is for one-off repair projects, not recurring maintenance. Each todo tracks likelihood, consequence, urgency, effort, cost, status, Home Assistant area, optional target date, and detailed notes.
+
+House todos default to active work so completed projects do not crowd the daily view. Use the status filter to audit done items or switch to all statuses.
 
 The priority score is inspired by a classic likelihood x consequence risk matrix, then adjusted for household reality: urgency and consequence push an item upward, while high effort and cost add drag. The risk map plots likelihood vertically and consequence horizontally; larger dots indicate higher expected cost.
 
@@ -89,10 +101,37 @@ The **Calendar** view shows maintenance items by next due date with month naviga
 
 The **All items** view shows every maintenance item with category, Home Assistant area, status, last completed date, next due date, recurrence, and quick actions.
 
+Use the filters to narrow the audit by search text, category, status, items due in the next 14 days, never-completed items, or assigned Home Assistant area.
+
 CSV exports are available for:
 
 - Maintenance items.
 - Completion history.
+- Lifecycle events.
+
+## Reports
+
+The **Reports** view shows annual maintenance completion trends, current overdue count, due-next-14 count, never-completed count, supplies-needed count, the most frequently completed items, and recent annual history.
+
+Reports also include a backup health panel that checks the SQLite schema, expected tables, expected maintenance columns, row counts, and database integrity.
+
+## Home Assistant Actions
+
+MxTracker exposes token-protected JSON endpoints for Home Assistant automations:
+
+- `POST /api/actions/mark_done`
+- `POST /api/actions/snooze`
+- `POST /api/actions/open_detail`
+
+Set `api_action_token` in the add-on configuration before using these endpoints. Use a long random value. Requests must include either `X-MxTracker-Token: <token>` or `Authorization: Bearer <token>`.
+
+Example body:
+
+```json
+{"task_id": 1, "days": 7}
+```
+
+Open **HA setup** in the app for generated `secrets.yaml`, `rest_command`, and actionable notification examples tailored to the add-on hostname when Home Assistant exposes it.
 
 ## Theme
 
@@ -106,6 +145,9 @@ Read-only endpoints:
 - `/api/tasks`
 - `/api/todos`
 - `/api/areas`
+- `/api/report`
+- `/api/backup/health`
+- `/api/homeassistant/examples`
 
 These are intended for local Home Assistant use.
 

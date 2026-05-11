@@ -1,7 +1,7 @@
 name: Home Maintenance Tracker
-version: "0.1.8"
+version: "2.0.0"
 slug: home_maintenance
-description: Track recurring home maintenance tasks from inside Home Assistant.
+description: Track recurring maintenance and house repair todos from inside Home Assistant.
 url: https://github.com/mondonea/MxTracker
 arch:
   - aarch64
@@ -25,10 +25,12 @@ options:
   publish_homeassistant_sensors: true
   homeassistant_publish_interval_seconds: 300
   seed_demo_data: false
+  api_action_token: ""
 schema:
   upcoming_window_days: int
   request_logging: bool
   publish_homeassistant_sensors: bool
   homeassistant_publish_interval_seconds: int
   seed_demo_data: bool
+  api_action_token: password
 backup: hot

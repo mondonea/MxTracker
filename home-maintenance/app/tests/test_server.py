@@ -85,6 +85,7 @@ class MaintenanceServerTests(unittest.TestCase):
         today = date.today()
         self.add_task("Replace AC filter", today, "HVAC", "Use 20x25x1 filter.")
         task = server.get_tasks()[0]
+        self.assertTrue(server.add_task_checklist_item(task["id"], "Turn off system"))
         self.assertTrue(server.complete_task(task["id"]))
 
         detail_task = server.get_enriched_task(task["id"])
@@ -95,6 +96,11 @@ class MaintenanceServerTests(unittest.TestCase):
         self.assertIn("Use 20x25x1 filter.", html)
         self.assertIn("<span>Category</span>HVAC", html)
         self.assertIn("<span>Home Assistant area</span>Unassigned", html)
+        self.assertIn("<span>Asset</span>Not set", html)
+        self.assertIn("Checklist", html)
+        self.assertIn("Turn off system", html)
+        self.assertIn("Lifecycle Events", html)
+        self.assertIn("Completed", html)
         self.assertIn("<span>Times completed</span>1", html)
         self.assertIn("<span>Created</span>", html)
         self.assertIn("<span>Updated</span>", html)
@@ -104,6 +110,84 @@ class MaintenanceServerTests(unittest.TestCase):
         self.assertIn('action="/snooze/1"', html)
         self.assertIn('href="/edit/1"', html)
         self.assertIn('href="/delete/1?return_to=%2Fitem%2F1"', html)
+
+    def test_task_asset_fields_checklist_reports_and_action_api(self):
+        today = date.today()
+        server.replace_homeassistant_areas([{"id": "utility", "name": "Utility Room"}])
+        errors, cleaned = server.validate_task_form(
+            {
+                "name": "Replace HVAC filter",
+                "category": "HVAC",
+                "notes": "Use MERV 8.",
+                "ha_area_id": "utility",
+                "asset_name": "Air handler",
+                "location": "Basement",
+                "model_number": "MX-100",
+                "serial_number": "SN-123",
+                "filter_size": "20x25x1",
+                "purchase_date": today.isoformat(),
+                "warranty_expires_on": (today + timedelta(days=365)).isoformat(),
+                "priority": "high",
+                "season": "year_round",
+                "tags": "filter, supplies",
+                "requires_supplies": "1",
+                "estimated_minutes": "15",
+                "interval_count": "3",
+                "interval_unit": "months",
+                "next_due_on": today.isoformat(),
+            }
+        )
+        self.assertEqual(errors, [])
+        server.save_task(cleaned)
+        task = server.get_tasks()[0]
+
+        self.assertEqual(task["asset_name"], "Air handler")
+        self.assertEqual(task["priority_label"], "High")
+        self.assertTrue(task["requires_supplies"])
+        self.assertTrue(server.add_task_checklist_item(task["id"], "Turn off system"))
+        item = server.get_task_checklist(task["id"])[0]
+        self.assertEqual(server.toggle_task_checklist_item(item["id"]), task["id"])
+        self.assertTrue(server.get_task_checklist(task["id"])[0]["is_done"])
+
+        status, response = server.handle_api_action("open_detail", {"task_id": task["id"]}, "/api/hassio_ingress/session")
+        self.assertEqual(status, server.HTTPStatus.OK)
+        self.assertEqual(response["detail_url"], "/api/hassio_ingress/session/?mx_item=1")
+        status, response = server.handle_api_action("snooze", {"task_id": task["id"], "days": 5})
+        self.assertEqual(status, server.HTTPStatus.OK)
+        self.assertEqual(response["task"]["next_due_on"], (today + timedelta(days=5)).isoformat())
+        status, _ = server.handle_api_action("snooze", {"task_id": task["id"], "days": 400})
+        self.assertEqual(status, server.HTTPStatus.BAD_REQUEST)
+
+        self.assertTrue(server.complete_task(task["id"]))
+        self.assertFalse(server.get_task_checklist(task["id"])[0]["is_done"])
+        report = server.annual_report(today.year)
+        self.assertEqual(report["completed"], 1)
+        self.assertEqual(report["requires_supplies"], 1)
+        health = server.backup_health()
+        self.assertEqual(health["status"], "ok")
+        self.assertIn("task_events", health["counts"])
+        self.assertNotIn("database_path", health)
+
+        csv_output = server.tasks_csv()
+        self.assertIn("Air handler", csv_output)
+        self.assertIn("20x25x1", csv_output)
+        events = server.get_task_events(task["id"])
+        event_types = [event["event_type"] for event in events]
+        self.assertIn("created", event_types)
+        self.assertIn("checklist_added", event_types)
+        self.assertIn("checklist_toggled", event_types)
+        self.assertIn("completed", event_types)
+        self.assertIn("Air handler", csv_output)
+        events_csv = server.events_csv()
+        self.assertIn("Checklist step toggled", events_csv)
+        self.assertIn("label=Turn off system", events_csv)
+        self.assertNotIn('{"label"', events_csv)
+        setup_html = server.render_ha_setup_view("csrf-token")
+        self.assertIn("mxtracker_mark_done", setup_html)
+        self.assertIn("mobile_app_notification_action", setup_html)
+        self.assertIn("PASTE_LONG_RANDOM_TOKEN_HERE", setup_html)
+        examples = server.homeassistant_examples()
+        self.assertIn("/api/actions/mark_done", examples["rest_command_yaml"])
 
     def test_root_query_item_selection_uses_item_detail_renderer(self):
         today = date.today()
@@ -169,6 +253,37 @@ class MaintenanceServerTests(unittest.TestCase):
         self.assertIn('class="button secondary nav-link active" href="/items" aria-current="page"', html)
         self.assertIn("<th>Area</th>", html)
         self.assertIn("<td data-label=\"Area\">Kitchen</td>", html)
+
+    def test_all_items_filters_search_status_category_and_area(self):
+        today = date.today()
+        server.replace_homeassistant_areas([{"id": "kitchen", "name": "Kitchen"}])
+        dishwasher = {
+            "name": "Clean dishwasher",
+            "category": "Appliances",
+            "notes": "Run cleaning cycle.",
+            "ha_area_id": "kitchen",
+            "interval_count": "1",
+            "interval_unit": "months",
+            "next_due_on": today.isoformat(),
+        }
+        errors, cleaned = server.validate_task_form(dishwasher)
+        self.assertEqual(errors, [])
+        server.save_task(cleaned)
+        self.add_task("Replace HVAC filter", today - timedelta(days=1), "HVAC")
+        self.add_task("Clean gutters", today + timedelta(days=40), "Exterior")
+
+        html = server.render_items_audit(
+            "csrf-token",
+            query={"q": ["dish"], "category": ["Appliances"], "area": ["kitchen"]},
+        )
+        self.assertIn("Clean dishwasher", html)
+        self.assertNotIn("Replace HVAC filter", html)
+        self.assertIn("1 of 3 maintenance items shown", html)
+
+        due_soon = server.render_items_audit("csrf-token", query={"status": ["due_14"]})
+        self.assertIn("Clean dishwasher", due_soon)
+        self.assertIn("Replace HVAC filter", due_soon)
+        self.assertNotIn("Clean gutters", due_soon)
 
     def test_homeassistant_area_sync_validation_and_sensor_payloads(self):
         self.assertIsNone(server.clean_ha_area_record({"id": None, "name": "Kitchen"}))
@@ -238,9 +353,20 @@ class MaintenanceServerTests(unittest.TestCase):
             area_table = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ha_areas'"
             ).fetchone()
+            checklist_table = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_checklist_items'"
+            ).fetchone()
+            events_table = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_events'"
+            ).fetchone()
         self.assertIn("ha_area_id", columns)
         self.assertIn("ha_area_name", columns)
+        self.assertIn("asset_name", columns)
+        self.assertIn("priority", columns)
+        self.assertIn("requires_supplies", columns)
         self.assertIsNotNone(area_table)
+        self.assertIsNotNone(checklist_table)
+        self.assertIsNotNone(events_table)
 
     def test_house_todo_scoring_readiness_and_detail_checklist(self):
         server.replace_homeassistant_areas([{"id": "bathroom", "name": "Bathroom"}])
@@ -335,6 +461,49 @@ class MaintenanceServerTests(unittest.TestCase):
         self.assertIn("Patch paint chip", html)
         self.assertIn('href="/todo/new"', html)
 
+    def test_house_todo_filters_keep_default_active_view_and_allow_done_audit(self):
+        server.save_todo(
+            {
+                "title": "Patch paint chip",
+                "category": "Interior",
+                "description": "",
+                "ha_area_id": "",
+                "ha_area_name": "",
+                "likelihood": 5,
+                "consequence": 1,
+                "urgency": 1,
+                "effort": 1,
+                "cost": 1,
+                "status": "done",
+                "target_on": "",
+            }
+        )
+        server.save_todo(
+            {
+                "title": "Replace sparking outlet",
+                "category": "Electrical",
+                "description": "Safety issue.",
+                "ha_area_id": "",
+                "ha_area_name": "",
+                "likelihood": 4,
+                "consequence": 5,
+                "urgency": 5,
+                "effort": 3,
+                "cost": 2,
+                "status": "planning",
+                "target_on": "",
+            }
+        )
+
+        default_html = server.render_todos_view("csrf-token")
+        self.assertIn("Replace sparking outlet", default_html)
+        self.assertNotIn("Patch paint chip", default_html)
+
+        done_html = server.render_todos_view("csrf-token", query={"status": ["done"]})
+        self.assertIn("Patch paint chip", done_html)
+        self.assertNotIn("Replace sparking outlet", done_html)
+        self.assertIn("1 of 2 house todos shown", done_html)
+
     def test_house_todo_homeassistant_sensor_payload_and_api_public_shape(self):
         project_id = server.save_todo(
             {
@@ -393,6 +562,19 @@ class MaintenanceServerTests(unittest.TestCase):
         payload = server.homeassistant_state_payloads()["sensor.mxtracker_house_todos"]
         self.assertEqual(payload["state"], "5")
         self.assertLessEqual(len(payload["attributes"]["items"]), 10)
+
+    def test_http_security_headers_are_sent_on_html_responses(self):
+        handler = server.MaintenanceHandler.__new__(server.MaintenanceHandler)
+        headers = {}
+        handler.send_header = lambda name, value: headers.__setitem__(name, value)
+
+        handler.set_security_headers()
+
+        self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+        self.assertEqual(headers["Referrer-Policy"], "same-origin")
+        self.assertEqual(headers["X-Frame-Options"], "SAMEORIGIN")
+        self.assertIn("camera=()", headers["Permissions-Policy"])
+        self.assertIn("default-src 'self'", headers["Content-Security-Policy"])
 
 
 if __name__ == "__main__":

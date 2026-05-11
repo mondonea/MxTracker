@@ -9,5 +9,6 @@ export HOME_MAINTENANCE_LOG_REQUESTS="$(bashio::config 'request_logging')"
 export HOME_MAINTENANCE_PUBLISH_HOMEASSISTANT="$(bashio::config 'publish_homeassistant_sensors')"
 export HOME_MAINTENANCE_HA_SYNC_INTERVAL_SECONDS="$(bashio::config 'homeassistant_publish_interval_seconds')"
 export HOME_MAINTENANCE_SEED_DEMO="$(bashio::config 'seed_demo_data')"
+export HOME_MAINTENANCE_API_ACTION_TOKEN="$(bashio::config 'api_action_token')"
 
 python3 /app/server.py

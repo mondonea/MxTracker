@@ -26,6 +26,17 @@ PORT = int(os.environ.get("HOME_MAINTENANCE_PORT", "8099"))
 ALLOWED_UNITS = {"days", "weeks", "months", "years"}
 CATEGORIES = ["General", "HVAC", "Plumbing", "Electrical", "Appliances", "Exterior", "Yard", "Safety", "Other"]
 TODO_CATEGORIES = ["General", "Plumbing", "Electrical", "Appliances", "Exterior", "Interior", "Safety", "Water", "Comfort", "Other"]
+PRIORITIES = {"low", "normal", "high", "critical"}
+PRIORITY_LABELS = {"low": "Low", "normal": "Normal", "high": "High", "critical": "Critical"}
+SEASONS = {"", "spring", "summer", "fall", "winter", "year_round"}
+SEASON_LABELS = {
+    "": "Any season",
+    "spring": "Spring",
+    "summer": "Summer",
+    "fall": "Fall",
+    "winter": "Winter",
+    "year_round": "Year round",
+}
 TODO_STATUSES = {"backlog", "planning", "ready", "in_work", "blocked", "done"}
 TODO_STATUS_LABELS = {
     "backlog": "Backlog",
@@ -40,6 +51,7 @@ STATUS_ORDER = {"overdue": 0, "due_today": 1, "upcoming": 2}
 CSRF_COOKIE = "hm_csrf"
 THEME_COOKIE = "hm_theme"
 THEMES = {"system", "light", "dark"}
+APP_VERSION = "2.0.0"
 MAX_FORM_BYTES = 16 * 1024
 CSRF_TOKEN_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
 HA_AREA_ID_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
@@ -76,6 +88,7 @@ SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "").strip()
 HOMEASSISTANT_REQUEST_TIMEOUT = 3
 HOMEASSISTANT_ENTITY_PREFIX = "mxtracker"
 HOMEASSISTANT_DASHBOARD_WINDOW_DAYS = 14
+API_ACTION_TOKEN = os.environ.get("HOME_MAINTENANCE_API_ACTION_TOKEN", "").strip()
 HA_PUBLISHER = None
 HOMEASSISTANT_AREAS_TEMPLATE = """
 {% set ns = namespace(items=[]) %}
@@ -172,6 +185,15 @@ def escape(value):
     return html.escape("" if value is None else str(value), quote=True)
 
 
+def query_first(query, name, default=""):
+    values = query.get(name, [default]) if query else [default]
+    return values[0].strip() if values else default
+
+
+def selected_attr(current, value):
+    return " selected" if current == value else ""
+
+
 @contextmanager
 def connect_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -201,6 +223,18 @@ def init_db():
                 notes TEXT NOT NULL DEFAULT '',
                 ha_area_id TEXT NOT NULL DEFAULT '',
                 ha_area_name TEXT NOT NULL DEFAULT '',
+                asset_name TEXT NOT NULL DEFAULT '',
+                location TEXT NOT NULL DEFAULT '',
+                model_number TEXT NOT NULL DEFAULT '',
+                serial_number TEXT NOT NULL DEFAULT '',
+                filter_size TEXT NOT NULL DEFAULT '',
+                purchase_date TEXT NOT NULL DEFAULT '',
+                warranty_expires_on TEXT NOT NULL DEFAULT '',
+                priority TEXT NOT NULL DEFAULT 'normal',
+                season TEXT NOT NULL DEFAULT '',
+                tags TEXT NOT NULL DEFAULT '',
+                requires_supplies INTEGER NOT NULL DEFAULT 0,
+                estimated_minutes INTEGER NOT NULL DEFAULT 0,
                 interval_count INTEGER NOT NULL,
                 interval_unit TEXT NOT NULL,
                 next_due_on TEXT NOT NULL,
@@ -217,6 +251,23 @@ def init_db():
             conn.execute("ALTER TABLE tasks ADD COLUMN ha_area_id TEXT NOT NULL DEFAULT ''")
         if "ha_area_name" not in columns:
             conn.execute("ALTER TABLE tasks ADD COLUMN ha_area_name TEXT NOT NULL DEFAULT ''")
+        task_column_defaults = {
+            "asset_name": "TEXT NOT NULL DEFAULT ''",
+            "location": "TEXT NOT NULL DEFAULT ''",
+            "model_number": "TEXT NOT NULL DEFAULT ''",
+            "serial_number": "TEXT NOT NULL DEFAULT ''",
+            "filter_size": "TEXT NOT NULL DEFAULT ''",
+            "purchase_date": "TEXT NOT NULL DEFAULT ''",
+            "warranty_expires_on": "TEXT NOT NULL DEFAULT ''",
+            "priority": "TEXT NOT NULL DEFAULT 'normal'",
+            "season": "TEXT NOT NULL DEFAULT ''",
+            "tags": "TEXT NOT NULL DEFAULT ''",
+            "requires_supplies": "INTEGER NOT NULL DEFAULT 0",
+            "estimated_minutes": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for column_name, definition in task_column_defaults.items():
+            if column_name not in columns:
+                conn.execute(f"ALTER TABLE tasks ADD COLUMN {column_name} {definition}")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS completion_history (
@@ -233,6 +284,7 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_next_due_on ON tasks(next_due_on, name)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_category ON tasks(category)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_ha_area ON tasks(ha_area_id, next_due_on)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(priority, next_due_on)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_history_completed_on ON completion_history(completed_on DESC, id DESC)")
         conn.execute(
             """
@@ -252,6 +304,35 @@ def init_db():
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ha_areas_name ON ha_areas(name, area_id)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS task_checklist_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL,
+                label TEXT NOT NULL,
+                is_done INTEGER NOT NULL DEFAULT 0,
+                position INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_task_checklist_task ON task_checklist_items(task_id, position, id)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS task_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL,
+                task_name TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                event_data TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, created_at DESC, id DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_task_events_created ON task_events(created_at DESC, id DESC)")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS todo_projects (
@@ -301,15 +382,7 @@ def get_tasks():
     tasks = []
     for row in rows:
         task = dict(row)
-        task["category"] = task.get("category") or "General"
-        task["ha_area_id"] = task.get("ha_area_id") or ""
-        task["ha_area_name"] = task.get("ha_area_name") or ""
-        task["status"] = classify_due(task["next_due_on"])
-        task["status_label"] = status_label(task["status"])
-        task["days_until"] = days_until(task["next_due_on"])
-        task["due_phrase"] = due_phrase(task["days_until"])
-        task["recurrence_phrase"] = recurrence_phrase(task["interval_count"], task["interval_unit"])
-        tasks.append(task)
+        tasks.append(enrich_task(task))
     return sorted(tasks, key=lambda item: (STATUS_ORDER[item["status"]], item["next_due_on"], item["name"].lower()))
 
 
@@ -323,6 +396,27 @@ def enrich_task(task):
     task["category"] = task.get("category") or "General"
     task["ha_area_id"] = task.get("ha_area_id") or ""
     task["ha_area_name"] = task.get("ha_area_name") or ""
+    for field in [
+        "asset_name",
+        "location",
+        "model_number",
+        "serial_number",
+        "filter_size",
+        "purchase_date",
+        "warranty_expires_on",
+        "priority",
+        "season",
+        "tags",
+    ]:
+        task[field] = task.get(field) or ("normal" if field == "priority" else "")
+    if task["priority"] not in PRIORITIES:
+        task["priority"] = "normal"
+    if task["season"] not in SEASONS:
+        task["season"] = ""
+    task["priority_label"] = PRIORITY_LABELS[task["priority"]]
+    task["season_label"] = SEASON_LABELS[task["season"]]
+    task["requires_supplies"] = bool(task.get("requires_supplies"))
+    task["estimated_minutes"] = int(task.get("estimated_minutes") or 0)
     task["status"] = classify_due(task["next_due_on"])
     task["status_label"] = status_label(task["status"])
     task["days_until"] = days_until(task["next_due_on"])
@@ -375,6 +469,163 @@ def get_all_history():
             """
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def get_task_checklist(task_id):
+    with connect_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM task_checklist_items
+            WHERE task_id = ?
+            ORDER BY position, id
+            """,
+            (task_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_task_checklist_item(item_id):
+    with connect_db() as conn:
+        row = conn.execute("SELECT * FROM task_checklist_items WHERE id = ?", (item_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def add_task_checklist_item(task_id, label):
+    label = label.strip()
+    task = get_task(task_id)
+    if not label or len(label) > 180 or not task:
+        return False
+    now = utc_now_iso()
+    with connect_db() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(position), 0) + 1 AS next_position FROM task_checklist_items WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO task_checklist_items (task_id, label, is_done, position, created_at, updated_at)
+            VALUES (?, ?, 0, ?, ?, ?)
+            """,
+            (task_id, label, row["next_position"], now, now),
+        )
+    request_homeassistant_sync()
+    record_task_event(task_id, task["name"], "checklist_added", {"label": label})
+    return True
+
+
+def toggle_task_checklist_item(item_id):
+    item = get_task_checklist_item(item_id)
+    if not item:
+        return None
+    now = utc_now_iso()
+    with connect_db() as conn:
+        conn.execute(
+            "UPDATE task_checklist_items SET is_done = ?, updated_at = ? WHERE id = ?",
+            (0 if item["is_done"] else 1, now, item_id),
+        )
+    request_homeassistant_sync()
+    task = get_task(item["task_id"])
+    if task:
+        record_task_event(item["task_id"], task["name"], "checklist_toggled", {"label": item["label"], "is_done": not bool(item["is_done"])})
+    return item["task_id"]
+
+
+def delete_task_checklist_item(item_id):
+    item = get_task_checklist_item(item_id)
+    if not item:
+        return None
+    with connect_db() as conn:
+        conn.execute("DELETE FROM task_checklist_items WHERE id = ?", (item_id,))
+    request_homeassistant_sync()
+    task = get_task(item["task_id"])
+    if task:
+        record_task_event(item["task_id"], task["name"], "checklist_deleted", {"label": item["label"]})
+    return item["task_id"]
+
+
+def record_task_event(task_id, task_name, event_type, event_data=None):
+    if not task_id or not task_name or not event_type:
+        return False
+    payload = json.dumps(event_data or {}, separators=(",", ":"), sort_keys=True)
+    if len(payload) > 4096:
+        payload = json.dumps({"truncated": True}, separators=(",", ":"))
+    with connect_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO task_events (task_id, task_name, event_type, event_data, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (task_id, task_name, event_type, payload, utc_now_iso()),
+        )
+    return True
+
+
+def get_task_events(task_id, limit=80):
+    with connect_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM task_events
+            WHERE task_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (task_id, limit),
+        ).fetchall()
+    events = []
+    for row in rows:
+        event = dict(row)
+        try:
+            event["event_data_json"] = json.loads(event["event_data"] or "{}")
+        except json.JSONDecodeError:
+            event["event_data_json"] = {}
+        events.append(event)
+    return events
+
+
+def get_all_task_events(limit=None):
+    sql = """
+        SELECT *
+        FROM task_events
+        ORDER BY created_at DESC, id DESC
+    """
+    params = ()
+    if limit is not None:
+        sql += " LIMIT ?"
+        params = (limit,)
+    with connect_db() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def event_type_label(event_type):
+    return {
+        "created": "Created",
+        "updated": "Updated",
+        "completed": "Completed",
+        "snoozed": "Snoozed",
+        "deleted": "Deleted",
+        "checklist_added": "Checklist step added",
+        "checklist_toggled": "Checklist step toggled",
+        "checklist_deleted": "Checklist step removed",
+    }.get(event_type, event_type.replace("_", " ").title())
+
+
+def summarize_event_data(raw_data):
+    try:
+        data = json.loads(raw_data or "{}")
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    details = []
+    if "changed" in data and isinstance(data["changed"], list) and data["changed"]:
+        details.append("changed=" + ",".join(str(item) for item in data["changed"][:12]))
+    for key in ["completed_on", "next_due_on", "from", "to", "days", "label", "is_done", "name"]:
+        if key in data and data[key] not in ("", None, []):
+            details.append(f"{key}={data[key]}")
+    return "; ".join(details)
 
 
 def clamp_score(value, default=2):
@@ -1002,6 +1253,141 @@ def summarize(tasks):
     }
 
 
+def task_matches_filters(task, filters):
+    q = filters["q"].lower()
+    if q:
+        searchable = " ".join(
+            [
+                task["name"],
+                task["notes"],
+                task["category"],
+                task.get("ha_area_name", ""),
+                task.get("ha_area_id", ""),
+                task.get("asset_name", ""),
+                task.get("location", ""),
+                task.get("model_number", ""),
+                task.get("serial_number", ""),
+                task.get("filter_size", ""),
+                task.get("tags", ""),
+                task.get("priority_label", ""),
+                task.get("season_label", ""),
+                task["recurrence_phrase"],
+                task["due_phrase"],
+            ]
+        ).lower()
+        if q not in searchable:
+            return False
+    if filters["category"] and task["category"] != filters["category"]:
+        return False
+    status = filters["status"]
+    if status == "due_14":
+        if task["status"] not in {"overdue", "due_today"} and task["days_until"] > HOMEASSISTANT_DASHBOARD_WINDOW_DAYS:
+            return False
+    elif status == "never_done":
+        if task["last_completed_on"]:
+            return False
+    elif status == "requires_supplies":
+        if not task["requires_supplies"]:
+            return False
+    elif status and task["status"] != status:
+        return False
+    area = filters["area"]
+    if area == "unassigned":
+        if task.get("ha_area_id"):
+            return False
+    elif area and task.get("ha_area_id") != area:
+        return False
+    return True
+
+
+def task_filters_from_query(query):
+    category = query_first(query, "category")
+    if category not in CATEGORIES:
+        category = ""
+    status = query_first(query, "status")
+    if status not in {"", "overdue", "due_today", "upcoming", "due_14", "never_done", "requires_supplies"}:
+        status = ""
+    area = query_first(query, "area")
+    known_areas = {area_item["area_id"] for area_item in get_homeassistant_areas()}
+    if area not in known_areas and area != "unassigned":
+        area = ""
+    return {
+        "q": query_first(query, "q")[:120],
+        "category": category,
+        "status": status,
+        "area": area,
+    }
+
+
+def filter_tasks(tasks, query):
+    filters = task_filters_from_query(query or {})
+    return [task for task in tasks if task_matches_filters(task, filters)], filters
+
+
+def todo_matches_filters(todo, filters):
+    q = filters["q"].lower()
+    if q:
+        searchable = " ".join(
+            [
+                todo["title"],
+                todo["description"],
+                todo["category"],
+                todo.get("ha_area_name", ""),
+                todo.get("ha_area_id", ""),
+                todo["status_label"],
+                todo["risk_band"],
+                todo["action_lane"],
+            ]
+        ).lower()
+        if q not in searchable:
+            return False
+    if filters["category"] and todo["category"] != filters["category"]:
+        return False
+    status = filters["status"]
+    if status == "active":
+        if todo["derived_status"] == "done":
+            return False
+    elif status and status != "all" and todo["derived_status"] != status:
+        return False
+    if filters["risk"] and todo["risk_band"] != filters["risk"]:
+        return False
+    area = filters["area"]
+    if area == "unassigned":
+        if todo.get("ha_area_id"):
+            return False
+    elif area and todo.get("ha_area_id") != area:
+        return False
+    return True
+
+
+def todo_filters_from_query(query):
+    category = query_first(query, "category")
+    if category not in TODO_CATEGORIES:
+        category = ""
+    status = query_first(query, "status", "active") or "active"
+    if status not in {"active", "all", "backlog", "planning", "ready", "in_work", "blocked", "done"}:
+        status = "active"
+    risk = query_first(query, "risk")
+    if risk not in {"", "critical", "high", "medium", "low"}:
+        risk = ""
+    area = query_first(query, "area")
+    known_areas = {area_item["area_id"] for area_item in get_homeassistant_areas()}
+    if area not in known_areas and area != "unassigned":
+        area = ""
+    return {
+        "q": query_first(query, "q")[:120],
+        "category": category,
+        "status": status,
+        "risk": risk,
+        "area": area,
+    }
+
+
+def filter_todos(todos, query):
+    filters = todo_filters_from_query(query or {})
+    return [todo for todo in todos if todo_matches_filters(todo, filters)], filters
+
+
 def homeassistant_detail_path(task_id):
     return f"/?mx_item={task_id}"
 
@@ -1018,6 +1404,13 @@ def homeassistant_task_row(task, base_path=""):
         "category": task["category"],
         "ha_area_id": task.get("ha_area_id", ""),
         "ha_area_name": task.get("ha_area_name", ""),
+        "asset_name": task.get("asset_name", ""),
+        "location": task.get("location", ""),
+        "priority": task.get("priority", "normal"),
+        "priority_label": task.get("priority_label", "Normal"),
+        "season": task.get("season", ""),
+        "season_label": task.get("season_label", "Any season"),
+        "requires_supplies": bool(task.get("requires_supplies")),
         "status": task["status_label"],
         "status_key": task["status"],
         "is_overdue": task["status"] == "overdue",
@@ -1155,6 +1548,14 @@ def homeassistant_state_payloads(tasks=None):
                 "item_count": len(items),
                 "dashboard_url": homeassistant_link(homeassistant_focus_path(), ingress_base_path),
                 "calendar_url": homeassistant_link("/calendar", ingress_base_path),
+                "reports_url": homeassistant_link("/reports", ingress_base_path),
+                "setup_url": homeassistant_link("/ha-setup", ingress_base_path),
+                "actions": {
+                    "mark_done": "/api/actions/mark_done",
+                    "snooze": "/api/actions/snooze",
+                    "open_detail": "/api/actions/open_detail",
+                    "requires_token": True,
+                },
                 "ingress_base_path": ingress_base_path,
                 "updated_at": updated_at,
             },
@@ -1188,6 +1589,14 @@ def homeassistant_state_payloads(tasks=None):
                 "window_days": HOMEASSISTANT_DASHBOARD_WINDOW_DAYS,
                 "dashboard_url": homeassistant_link(homeassistant_focus_path(), ingress_base_path),
                 "calendar_url": homeassistant_link("/calendar", ingress_base_path),
+                "reports_url": homeassistant_link("/reports", ingress_base_path),
+                "setup_url": homeassistant_link("/ha-setup", ingress_base_path),
+                "actions": {
+                    "mark_done": "/api/actions/mark_done",
+                    "snooze": "/api/actions/snooze",
+                    "open_detail": "/api/actions/open_detail",
+                    "requires_token": True,
+                },
                 "ingress_base_path": ingress_base_path,
                 "updated_at": updated_at,
             },
@@ -1202,6 +1611,8 @@ def homeassistant_state_payloads(tasks=None):
                 "item_count": len(all_items),
                 "dashboard_url": homeassistant_link("/items", ingress_base_path),
                 "calendar_url": homeassistant_link("/calendar", ingress_base_path),
+                "reports_url": homeassistant_link("/reports", ingress_base_path),
+                "setup_url": homeassistant_link("/ha-setup", ingress_base_path),
                 "ingress_base_path": ingress_base_path,
                 "updated_at": updated_at,
             },
@@ -1236,6 +1647,7 @@ def homeassistant_state_payloads(tasks=None):
                 "ready_count": len(todo_ready),
                 "in_work_count": len(todo_in_work),
                 "dashboard_url": homeassistant_link("/todos", ingress_base_path),
+                "setup_url": homeassistant_link("/ha-setup", ingress_base_path),
                 "ingress_base_path": ingress_base_path,
                 "updated_at": updated_at,
             },
@@ -1253,6 +1665,20 @@ def public_task(task):
         "ha_area_id": task.get("ha_area_id", ""),
         "ha_area_name": task.get("ha_area_name", ""),
         "notes": task["notes"],
+        "asset_name": task.get("asset_name", ""),
+        "location": task.get("location", ""),
+        "model_number": task.get("model_number", ""),
+        "serial_number": task.get("serial_number", ""),
+        "filter_size": task.get("filter_size", ""),
+        "purchase_date": task.get("purchase_date", ""),
+        "warranty_expires_on": task.get("warranty_expires_on", ""),
+        "priority": task.get("priority", "normal"),
+        "priority_label": task.get("priority_label", "Normal"),
+        "season": task.get("season", ""),
+        "season_label": task.get("season_label", "Any season"),
+        "tags": task.get("tags", ""),
+        "requires_supplies": bool(task.get("requires_supplies")),
+        "estimated_minutes": task.get("estimated_minutes", 0),
         "interval_count": task["interval_count"],
         "interval_unit": task["interval_unit"],
         "next_due_on": task["next_due_on"],
@@ -1300,7 +1726,7 @@ def csv_cell(value):
 
 
 def safe_return_path(value):
-    if value in {"/", "/items", "/focus", "/calendar", "/todos", "/todo/new"}:
+    if value in {"/", "/items", "/focus", "/calendar", "/reports", "/ha-setup", "/todos", "/todo/new"}:
         return value
     if value.startswith("/item/") and value.removeprefix("/item/").isdigit():
         return value
@@ -1345,7 +1771,7 @@ def safe_referer_path(value, base_path=""):
     base_path = normalize_base_path(base_path)
     if base_path and path.startswith(base_path):
         path = path.removeprefix(base_path) or "/"
-    if path not in {"/", "/items", "/new", "/focus", "/calendar", "/todos", "/todo/new"} and not path.startswith(("/edit/", "/item/", "/todo/", "/todo/edit/")):
+    if path not in {"/", "/items", "/new", "/focus", "/calendar", "/reports", "/ha-setup", "/todos", "/todo/new"} and not path.startswith(("/edit/", "/item/", "/todo/", "/todo/edit/")):
         return "/"
     return path
 
@@ -1364,6 +1790,18 @@ def tasks_csv():
             "Recurrence",
             "Home Assistant area",
             "Home Assistant area ID",
+            "Asset",
+            "Location",
+            "Model number",
+            "Serial number",
+            "Filter size",
+            "Purchase date",
+            "Warranty expires",
+            "Priority",
+            "Season",
+            "Tags",
+            "Requires supplies",
+            "Estimated minutes",
             "Notes",
         ]
     )
@@ -1379,6 +1817,18 @@ def tasks_csv():
                 csv_cell(task["recurrence_phrase"]),
                 csv_cell(task.get("ha_area_name", "")),
                 csv_cell(task.get("ha_area_id", "")),
+                csv_cell(task.get("asset_name", "")),
+                csv_cell(task.get("location", "")),
+                csv_cell(task.get("model_number", "")),
+                csv_cell(task.get("serial_number", "")),
+                csv_cell(task.get("filter_size", "")),
+                csv_cell(task.get("purchase_date", "")),
+                csv_cell(task.get("warranty_expires_on", "")),
+                csv_cell(task.get("priority_label", "")),
+                csv_cell(task.get("season_label", "")),
+                csv_cell(task.get("tags", "")),
+                csv_cell("Yes" if task.get("requires_supplies") else "No"),
+                csv_cell(task.get("estimated_minutes", 0)),
                 csv_cell(task["notes"]),
             ]
         )
@@ -1399,6 +1849,262 @@ def history_csv():
             ]
         )
     return output.getvalue()
+
+
+def events_csv():
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Task ID", "Task", "Event", "Details", "Recorded at"])
+    for item in get_all_task_events():
+        writer.writerow(
+            [
+                csv_cell(item["task_id"]),
+                csv_cell(item["task_name"]),
+                csv_cell(event_type_label(item["event_type"])),
+                csv_cell(summarize_event_data(item["event_data"])),
+                csv_cell(item["created_at"]),
+            ]
+        )
+    return output.getvalue()
+
+
+def backup_health():
+    expected_tables = {
+        "tasks",
+        "completion_history",
+        "task_checklist_items",
+        "task_events",
+        "todo_projects",
+        "todo_checklist_items",
+        "ha_areas",
+        "app_settings",
+    }
+    expected_task_columns = {
+        "id",
+        "name",
+        "category",
+        "notes",
+        "ha_area_id",
+        "ha_area_name",
+        "asset_name",
+        "location",
+        "model_number",
+        "serial_number",
+        "filter_size",
+        "purchase_date",
+        "warranty_expires_on",
+        "priority",
+        "season",
+        "tags",
+        "requires_supplies",
+        "estimated_minutes",
+        "interval_count",
+        "interval_unit",
+        "next_due_on",
+        "last_completed_on",
+        "created_at",
+        "updated_at",
+    }
+    errors = []
+    counts = {}
+    with connect_db() as conn:
+        tables = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        }
+        missing_tables = sorted(expected_tables - tables)
+        if missing_tables:
+            errors.append(f"Missing tables: {', '.join(missing_tables)}")
+        task_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()} if "tasks" in tables else set()
+        missing_task_columns = sorted(expected_task_columns - task_columns)
+        if missing_task_columns:
+            errors.append(f"Missing task columns: {', '.join(missing_task_columns)}")
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        if integrity != "ok":
+            errors.append(f"SQLite integrity check failed: {integrity}")
+        for table in sorted(expected_tables & tables):
+            counts[table] = int(conn.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()["count"])
+    return {
+        "status": "ok" if not errors else "error",
+        "version": APP_VERSION,
+        "backup_scope": "/data/home-maintenance.db",
+        "checked_at": utc_now_iso(),
+        "errors": errors,
+        "counts": counts,
+    }
+
+
+def addon_internal_url():
+    slug = get_setting("addon_slug", "").strip()
+    if slug:
+        return f"http://{slug.replace('_', '-')}:8099"
+    return "http://REPLACE_ADDON_HOSTNAME:8099"
+
+
+def homeassistant_examples():
+    base_url = addon_internal_url()
+    rest_command_yaml = f"""
+mxtracker_mark_done:
+  url: "{base_url}/api/actions/mark_done"
+  method: post
+  content_type: "application/json"
+  headers:
+    X-MxTracker-Token: !secret mxtracker_api_action_token
+  payload: '{{"task_id": {{{{ task_id | int }}}}}}'
+
+mxtracker_snooze:
+  url: "{base_url}/api/actions/snooze"
+  method: post
+  content_type: "application/json"
+  headers:
+    X-MxTracker-Token: !secret mxtracker_api_action_token
+  payload: '{{"task_id": {{{{ task_id | int }}}}, "days": {{{{ days | default(7) | int }}}}}}'
+""".strip()
+    notification_yaml = """
+alias: MxTracker actionable maintenance reminder
+mode: restart
+trigger:
+  - platform: state
+    entity_id: sensor.mxtracker_due_14_days
+condition:
+  - condition: numeric_state
+    entity_id: sensor.mxtracker_due_14_days
+    above: 0
+action:
+  - variables:
+      item: "{{ state_attr('sensor.mxtracker_due_14_days', 'items')[0] }}"
+      action_done: "{{ 'MX_DONE_' ~ context.id }}"
+      action_snooze: "{{ 'MX_SNOOZE_' ~ context.id }}"
+  - action: notify.mobile_app_YOUR_DEVICE
+    data:
+      title: "Maintenance due: {{ item.name }}"
+      message: "{{ item.due_phrase }} - {{ item.category }} - Last done {{ item.last_done }}"
+      data:
+        url: "{{ item.detail_url }}"
+        actions:
+          - action: "{{ action_done }}"
+            title: Done
+          - action: "{{ action_snooze }}"
+            title: Snooze 7d
+          - action: URI
+            title: Open details
+            uri: "{{ item.detail_url }}"
+  - wait_for_trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: "{{ action_done }}"
+      - platform: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: "{{ action_snooze }}"
+    timeout: "00:30:00"
+    continue_on_timeout: false
+  - choose:
+      - conditions: "{{ wait.trigger.event.data.action == action_done }}"
+        sequence:
+          - action: rest_command.mxtracker_mark_done
+            data:
+              task_id: "{{ item.id }}"
+      - conditions: "{{ wait.trigger.event.data.action == action_snooze }}"
+        sequence:
+          - action: rest_command.mxtracker_snooze
+            data:
+              task_id: "{{ item.id }}"
+              days: 7
+""".strip()
+    secrets_yaml = """
+mxtracker_api_action_token: "PASTE_LONG_RANDOM_TOKEN_HERE"
+""".strip()
+    return {
+        "addon_internal_url": base_url,
+        "rest_command_yaml": rest_command_yaml,
+        "notification_automation_yaml": notification_yaml,
+        "secrets_yaml": secrets_yaml,
+    }
+
+
+def annual_report(year=None):
+    current_year = date.today().year
+    try:
+        report_year = int(year or current_year)
+    except (TypeError, ValueError):
+        report_year = current_year
+    if report_year < 2000 or report_year > 2100:
+        report_year = current_year
+    tasks = get_tasks()
+    start = f"{report_year}-01-01"
+    end = f"{report_year}-12-31"
+    with connect_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT task_id, task_name, completed_on, next_due_on, created_at
+            FROM completion_history
+            WHERE completed_on BETWEEN ? AND ?
+            ORDER BY completed_on DESC, id DESC
+            """,
+            (start, end),
+        ).fetchall()
+    completions = [dict(row) for row in rows]
+    by_month = {month: 0 for month in range(1, 13)}
+    by_task = {}
+    for item in completions:
+        completed = parse_date(item["completed_on"])
+        by_month[completed.month] += 1
+        by_task[item["task_name"]] = by_task.get(item["task_name"], 0) + 1
+    return {
+        "year": report_year,
+        "total_items": len(tasks),
+        "overdue": sum(1 for task in tasks if task["status"] == "overdue"),
+        "due_next_14": sum(
+            1
+            for task in tasks
+            if task["status"] in {"overdue", "due_today"} or task["days_until"] <= HOMEASSISTANT_DASHBOARD_WINDOW_DAYS
+        ),
+        "never_completed": sum(1 for task in tasks if not task["last_completed_on"]),
+        "requires_supplies": sum(1 for task in tasks if task.get("requires_supplies")),
+        "completed": len(completions),
+        "by_month": by_month,
+        "top_completed": sorted(by_task.items(), key=lambda item: (-item[1], item[0].lower()))[:8],
+        "recent": completions[:12],
+    }
+
+
+def handle_api_action(action, payload, base_path=""):
+    if not isinstance(payload, dict):
+        return HTTPStatus.BAD_REQUEST, {"ok": False, "error": "JSON body must be an object."}
+    try:
+        task_id = int(payload.get("task_id", 0))
+    except (TypeError, ValueError):
+        task_id = 0
+    if task_id < 1:
+        return HTTPStatus.BAD_REQUEST, {"ok": False, "error": "task_id is required."}
+    task = get_enriched_task(task_id)
+    if not task:
+        return HTTPStatus.NOT_FOUND, {"ok": False, "error": "Maintenance item not found."}
+    if action == "mark_done":
+        complete_task(task_id)
+        updated = get_enriched_task(task_id)
+        return HTTPStatus.OK, {"ok": True, "action": action, "task": public_task(updated)}
+    if action == "snooze":
+        try:
+            days = int(payload.get("days", 7))
+        except (TypeError, ValueError):
+            days = 7
+        if days < 1 or days > 365:
+            return HTTPStatus.BAD_REQUEST, {"ok": False, "error": "days must be between 1 and 365."}
+        snooze_task(task_id, days)
+        updated = get_enriched_task(task_id)
+        return HTTPStatus.OK, {"ok": True, "action": action, "task": public_task(updated)}
+    if action == "open_detail":
+        detail_path = homeassistant_detail_path(task_id)
+        return HTTPStatus.OK, {
+            "ok": True,
+            "action": action,
+            "task_id": task_id,
+            "detail_url": homeassistant_link(detail_path, base_path),
+        }
+    return HTTPStatus.NOT_FOUND, {"ok": False, "error": "Unknown action."}
 
 
 def post_homeassistant_state(entity_id, payload):
@@ -1484,11 +2190,26 @@ def validate_task_form(fields):
     ha_area_name = ""
     interval_unit = fields.get("interval_unit", "").strip()
     next_due_on = fields.get("next_due_on", "").strip()
+    asset_name = fields.get("asset_name", "").strip()
+    location = fields.get("location", "").strip()
+    model_number = fields.get("model_number", "").strip()
+    serial_number = fields.get("serial_number", "").strip()
+    filter_size = fields.get("filter_size", "").strip()
+    purchase_date = fields.get("purchase_date", "").strip()
+    warranty_expires_on = fields.get("warranty_expires_on", "").strip()
+    priority = fields.get("priority", "normal").strip()
+    season = fields.get("season", "").strip()
+    tags = fields.get("tags", "").strip()
+    requires_supplies = fields.get("requires_supplies") == "1"
 
     try:
         interval_count = int(fields.get("interval_count", ""))
     except ValueError:
         interval_count = 0
+    try:
+        estimated_minutes = int(fields.get("estimated_minutes", "0") or "0")
+    except ValueError:
+        estimated_minutes = -1
 
     if not name:
         errors.append("Name is required.")
@@ -1498,6 +2219,29 @@ def validate_task_form(fields):
         errors.append("Choose a valid category.")
     if len(notes) > 1000:
         errors.append("Notes must be 1000 characters or fewer.")
+    length_limits = {
+        "Asset name": (asset_name, 120),
+        "Location": (location, 120),
+        "Model number": (model_number, 120),
+        "Serial number": (serial_number, 120),
+        "Filter size": (filter_size, 80),
+        "Tags": (tags, 200),
+    }
+    for label, (value, limit) in length_limits.items():
+        if len(value) > limit:
+            errors.append(f"{label} must be {limit} characters or fewer.")
+    if priority not in PRIORITIES:
+        errors.append("Choose a valid priority.")
+    if season not in SEASONS:
+        errors.append("Choose a valid season.")
+    for field_label, raw_date in [("Purchase date", purchase_date), ("Warranty date", warranty_expires_on)]:
+        if raw_date:
+            try:
+                parse_date(raw_date)
+            except ValueError:
+                errors.append(f"{field_label} must be valid.")
+    if estimated_minutes < 0 or estimated_minutes > 10080:
+        errors.append("Estimated minutes must be between 0 and 10080.")
     if ha_area_id:
         area_lookup = homeassistant_area_lookup()
         if not valid_ha_area_id(ha_area_id):
@@ -1525,6 +2269,18 @@ def validate_task_form(fields):
         "notes": notes,
         "ha_area_id": ha_area_id,
         "ha_area_name": ha_area_name,
+        "asset_name": asset_name,
+        "location": location,
+        "model_number": model_number,
+        "serial_number": serial_number,
+        "filter_size": filter_size,
+        "purchase_date": purchase_date,
+        "warranty_expires_on": warranty_expires_on,
+        "priority": priority,
+        "season": season,
+        "tags": tags,
+        "requires_supplies": 1 if requires_supplies else 0,
+        "estimated_minutes": estimated_minutes,
         "interval_count": interval_count,
         "interval_unit": interval_unit,
         "next_due_on": next_due_on,
@@ -1533,13 +2289,16 @@ def validate_task_form(fields):
 
 def save_task(fields, task_id=None):
     now = utc_now_iso()
+    previous = get_task(task_id) if task_id is not None else None
     with connect_db() as conn:
         if task_id is None:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 INSERT INTO tasks
-                    (name, category, notes, ha_area_id, ha_area_name, interval_count, interval_unit, next_due_on, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (name, category, notes, ha_area_id, ha_area_name, asset_name, location, model_number,
+                     serial_number, filter_size, purchase_date, warranty_expires_on, priority, season, tags,
+                     requires_supplies, estimated_minutes, interval_count, interval_unit, next_due_on, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     fields["name"],
@@ -1547,6 +2306,18 @@ def save_task(fields, task_id=None):
                     fields["notes"],
                     fields.get("ha_area_id", ""),
                     fields.get("ha_area_name", ""),
+                    fields.get("asset_name", ""),
+                    fields.get("location", ""),
+                    fields.get("model_number", ""),
+                    fields.get("serial_number", ""),
+                    fields.get("filter_size", ""),
+                    fields.get("purchase_date", ""),
+                    fields.get("warranty_expires_on", ""),
+                    fields.get("priority", "normal"),
+                    fields.get("season", ""),
+                    fields.get("tags", ""),
+                    fields.get("requires_supplies", 0),
+                    fields.get("estimated_minutes", 0),
                     fields["interval_count"],
                     fields["interval_unit"],
                     fields["next_due_on"],
@@ -1554,11 +2325,16 @@ def save_task(fields, task_id=None):
                     now,
                 ),
             )
+            task_id = cursor.lastrowid
         else:
             conn.execute(
                 """
                 UPDATE tasks
-                SET name = ?, category = ?, notes = ?, ha_area_id = ?, ha_area_name = ?, interval_count = ?, interval_unit = ?, next_due_on = ?, updated_at = ?
+                SET name = ?, category = ?, notes = ?, ha_area_id = ?, ha_area_name = ?,
+                    asset_name = ?, location = ?, model_number = ?, serial_number = ?, filter_size = ?,
+                    purchase_date = ?, warranty_expires_on = ?, priority = ?, season = ?, tags = ?,
+                    requires_supplies = ?, estimated_minutes = ?,
+                    interval_count = ?, interval_unit = ?, next_due_on = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -1567,6 +2343,18 @@ def save_task(fields, task_id=None):
                     fields["notes"],
                     fields.get("ha_area_id", ""),
                     fields.get("ha_area_name", ""),
+                    fields.get("asset_name", ""),
+                    fields.get("location", ""),
+                    fields.get("model_number", ""),
+                    fields.get("serial_number", ""),
+                    fields.get("filter_size", ""),
+                    fields.get("purchase_date", ""),
+                    fields.get("warranty_expires_on", ""),
+                    fields.get("priority", "normal"),
+                    fields.get("season", ""),
+                    fields.get("tags", ""),
+                    fields.get("requires_supplies", 0),
+                    fields.get("estimated_minutes", 0),
                     fields["interval_count"],
                     fields["interval_unit"],
                     fields["next_due_on"],
@@ -1575,6 +2363,38 @@ def save_task(fields, task_id=None):
                 ),
             )
     request_homeassistant_sync()
+    event_name = fields["name"]
+    if previous is None:
+        record_task_event(task_id, event_name, "created", {"next_due_on": fields["next_due_on"]})
+    else:
+        changed = [
+            key
+            for key in [
+                "name",
+                "category",
+                "notes",
+                "ha_area_id",
+                "ha_area_name",
+                "asset_name",
+                "location",
+                "model_number",
+                "serial_number",
+                "filter_size",
+                "purchase_date",
+                "warranty_expires_on",
+                "priority",
+                "season",
+                "tags",
+                "requires_supplies",
+                "estimated_minutes",
+                "interval_count",
+                "interval_unit",
+                "next_due_on",
+            ]
+            if str(previous.get(key, "")) != str(fields.get(key, ""))
+        ]
+        record_task_event(task_id, event_name, "updated", {"changed": changed})
+    return task_id
 
 
 def complete_task(task_id):
@@ -1605,7 +2425,12 @@ def complete_task(task_id):
             """,
             (task_id, task["name"], completed_on, next_due, now),
         )
+        conn.execute(
+            "UPDATE task_checklist_items SET is_done = 0, updated_at = ? WHERE task_id = ?",
+            (now, task_id),
+        )
     request_homeassistant_sync()
+    record_task_event(task_id, task["name"], "completed", {"completed_on": completed_on, "next_due_on": next_due})
     return True
 
 
@@ -1614,19 +2439,24 @@ def snooze_task(task_id, days=7):
     if not task:
         return False
     next_due = (date.today() + timedelta(days=days)).isoformat()
+    previous_due = task["next_due_on"]
     with connect_db() as conn:
         conn.execute(
             "UPDATE tasks SET next_due_on = ?, updated_at = ? WHERE id = ?",
             (next_due, utc_now_iso(), task_id),
         )
     request_homeassistant_sync()
+    record_task_event(task_id, task["name"], "snoozed", {"from": previous_due, "to": next_due, "days": days})
     return True
 
 
 def delete_task(task_id):
+    task = get_task(task_id)
     with connect_db() as conn:
         conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
     request_homeassistant_sync()
+    if task:
+        record_task_event(task_id, task["name"], "deleted", {"name": task["name"]})
 
 
 def render_layout(title, body, csrf_token, notice="", theme="system", base_path="", active_view=""):
@@ -1637,10 +2467,13 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
         active = " active" if theme == mode else ""
         theme_links.append(f'<a class="theme-link{active}" href="{app_url(f"/theme/{mode}", base_path)}">{mode.title()}</a>')
     nav_items = [
-        ("dashboard", "Dashboard", "/"),
-        ("todos", "House todos", "/todos"),
-        ("items", "All items", "/items"),
+        ("today", "Today", "/"),
+        ("soon", "Soon", "/focus"),
+        ("audit", "Audit", "/items"),
         ("calendar", "Calendar", "/calendar"),
+        ("reports", "Reports", "/reports"),
+        ("todos", "House todos", "/todos"),
+        ("ha_setup", "HA setup", "/ha-setup"),
         ("new", "Add item", "/new"),
     ]
     nav_links = []
@@ -1720,6 +2553,16 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
       line-height: 1.45;
     }}
     a {{ color: var(--accent-strong); }}
+    pre {{
+      overflow-x: auto;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-strong);
+      color: var(--text);
+      font-size: .9rem;
+      line-height: 1.45;
+    }}
     .wrap {{ width: min(1120px, calc(100% - 32px)); margin: 0 auto; }}
     header {{
       border-bottom: 1px solid var(--line);
@@ -1865,6 +2708,11 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
       padding: 9px 10px;
       font: inherit;
     }}
+    label input[type="checkbox"] {{
+      width: auto;
+      min-height: auto;
+      margin-right: 8px;
+    }}
     textarea {{ min-height: 120px; resize: vertical; }}
     .form-row {{
       display: grid;
@@ -1996,6 +2844,11 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
       gap: 12px;
       margin: 16px 0;
     }}
+    .detail-section {{
+      margin-top: 18px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+    }}
     .detail-field {{
       padding: 12px;
       border: 1px solid var(--line);
@@ -2038,6 +2891,28 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
       gap: 10px;
       flex-wrap: wrap;
       margin: 0 0 18px;
+    }}
+    .filter-panel {{
+      margin-bottom: 18px;
+    }}
+    .filter-grid {{
+      display: grid;
+      grid-template-columns: minmax(190px, 1.4fr) repeat(4, minmax(120px, 1fr));
+      gap: 12px;
+      align-items: end;
+    }}
+    .filter-grid label {{
+      margin-top: 0;
+    }}
+    .filter-actions {{
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }}
+    .result-count {{
+      margin-top: 12px;
+      color: var(--muted);
+      font-weight: 800;
     }}
     .table-head {{
       display: flex;
@@ -2218,6 +3093,27 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
       grid-template-columns: repeat(5, minmax(0, 1fr));
       gap: 10px;
     }}
+    .report-bars {{
+      display: grid;
+      gap: 8px;
+    }}
+    .report-bar {{
+      display: grid;
+      grid-template-columns: 42px minmax(0, 1fr) 42px;
+      gap: 10px;
+      align-items: center;
+    }}
+    .bar-track {{
+      height: 12px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      overflow: hidden;
+      background: var(--surface-strong);
+    }}
+    .bar-fill {{
+      height: 100%;
+      background: var(--accent);
+    }}
     .scale-grid label {{
       margin-top: 0;
     }}
@@ -2237,6 +3133,7 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
       .todo-board {{ grid-template-columns: 1fr; }}
       .todo-toolbar {{ align-items: stretch; flex-direction: column; }}
       .todo-toolbar .actions, .todo-toolbar .button {{ width: 100%; }}
+      .filter-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .scale-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .task-table, .task-table tbody, .task-table tr, .task-table td {{ display: block; width: 100%; max-width: 100%; }}
       .task-table thead {{ display: none; }}
@@ -2299,6 +3196,8 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
       .focus-item {{ grid-template-columns: 1fr; }}
       .todo-card {{ grid-template-columns: 1fr; }}
       .mini-form {{ grid-template-columns: 1fr; }}
+      .filter-grid {{ grid-template-columns: 1fr; }}
+      .filter-actions .button, .filter-actions button {{ width: 100%; }}
       .check-item.child {{ margin-left: 12px; }}
       .risk-matrix {{ grid-template-columns: 34px repeat(5, minmax(46px, 1fr)); overflow-x: auto; }}
       .matrix-cell {{ min-height: 58px; }}
@@ -2446,7 +3345,7 @@ def render_dashboard(csrf_token, notice="", theme="system", base_path=""):
             f"""
             <div class="history-item">
               <strong>{escape(item["task_name"])}</strong>
-              <div>Completed {escape(item["completed_on"])} · Next due {escape(item["next_due_on"])}</div>
+              <div>Completed {escape(item["completed_on"])} - Next due {escape(item["next_due_on"])}</div>
             </div>
             """
         )
@@ -2454,6 +3353,10 @@ def render_dashboard(csrf_token, notice="", theme="system", base_path=""):
         history_items.append('<div class="empty">No completed tasks yet.</div>')
 
     body = f"""
+      <div class="audit-actions">
+        <a class="button" href="{app_url("/focus", base_path)}">Due next 14 days</a>
+        <a class="button secondary" href="{app_url("/calendar", base_path)}">Open calendar</a>
+      </div>
       <section class="grid" aria-label="Maintenance summary">
         <div class="stat"><strong>{summary["overdue"]}</strong><span>Overdue</span></div>
         <div class="stat"><strong>{summary["due_today"]}</strong><span>Due today</span></div>
@@ -2475,7 +3378,7 @@ def render_dashboard(csrf_token, notice="", theme="system", base_path=""):
         </aside>
       </section>
     """
-    return render_layout("Home Maintenance", body, csrf_token, notice, theme, base_path, active_view="dashboard")
+    return render_layout("Today", body, csrf_token, notice, theme, base_path, active_view="today")
 
 
 def render_root_page(query, csrf_token, notice="", theme="system", base_path=""):
@@ -2527,16 +3430,17 @@ def render_focus_view(csrf_token, notice="", theme="system", base_path=""):
             <h2>Due Next 14 Days</h2>
             <div class="meta">Overdue items stay visible until completed or snoozed.</div>
           </div>
-          <a class="button secondary" href="{app_url("/", base_path)}">Open dashboard</a>
+          <a class="button secondary" href="{app_url("/", base_path)}">Open today</a>
         </div>
         <div class="focus-list">{content}</div>
       </section>
     """
-    return render_layout("Maintenance Due Soon", body, csrf_token, notice, theme, base_path, active_view="dashboard")
+    return render_layout("Maintenance Due Soon", body, csrf_token, notice, theme, base_path, active_view="soon")
 
 
-def render_todos_view(csrf_token, notice="", theme="system", base_path=""):
+def render_todos_view(csrf_token, query=None, notice="", theme="system", base_path=""):
     todos = get_todos()
+    visible_todos, filters = filter_todos(todos, query or {})
     active_todos = [todo for todo in todos if todo["derived_status"] != "done"]
     summary = {
         "active": len(active_todos),
@@ -2545,7 +3449,7 @@ def render_todos_view(csrf_token, notice="", theme="system", base_path=""):
         "blocked": sum(1 for todo in active_todos if todo["derived_status"] == "blocked"),
     }
     cards = []
-    for todo in active_todos:
+    for todo in visible_todos:
         area = f'<span class="meta">{escape(todo["ha_area_name"])}</span>' if todo.get("ha_area_name") else ""
         target = f'<span class="meta">Target {escape(todo["target_on"])}</span>' if todo.get("target_on") else ""
         cards.append(
@@ -2563,20 +3467,45 @@ def render_todos_view(csrf_token, notice="", theme="system", base_path=""):
                 <div class="progress-bar" aria-label="Progress {todo["progress_percent"]}%">
                   <div class="progress-fill" style="width: {todo["progress_percent"]}%"></div>
                 </div>
-                <div class="meta">{todo["progress_percent"]}% done · Risk {todo["hazard_score"]}/25 · Effort {todo["effort"]}/5 · Cost {todo["cost"]}/5</div>
+                <div class="meta">{todo["progress_percent"]}% done - Risk {todo["hazard_score"]}/25 - Effort {todo["effort"]}/5 - Cost {todo["cost"]}/5</div>
               </div>
               <span class="score-pill">{escape(todo["priority_score"])}</span>
             </a>
             """
         )
     if not cards:
-        cards.append('<div class="empty">No active house todos yet.</div>')
+        cards.append('<div class="empty">No house todos match these filters.</div>')
+
+    category_options = ['<option value="">All categories</option>']
+    for category in TODO_CATEGORIES:
+        category_options.append(f'<option value="{escape(category)}"{selected_attr(filters["category"], category)}>{escape(category)}</option>')
+    status_options = [
+        ("active", "Active"),
+        ("all", "All statuses"),
+        ("ready", "Ready"),
+        ("in_work", "In work"),
+        ("blocked", "Blocked"),
+        ("planning", "Planning"),
+        ("backlog", "Backlog"),
+        ("done", "Done"),
+    ]
+    status_options_html = "".join(
+        f'<option value="{status}"{selected_attr(filters["status"], status)}>{escape(label)}</option>'
+        for status, label in status_options
+    )
+    risk_options = ['<option value="">All risk</option>']
+    for risk, label in [("critical", "Critical"), ("high", "High"), ("medium", "Medium"), ("low", "Low")]:
+        risk_options.append(f'<option value="{risk}"{selected_attr(filters["risk"], risk)}>{label}</option>')
+    area_options = [f'<option value=""{selected_attr(filters["area"], "")}>All areas</option>']
+    area_options.append(f'<option value="unassigned"{selected_attr(filters["area"], "unassigned")}>Unassigned</option>')
+    for area in get_homeassistant_areas():
+        area_options.append(f'<option value="{escape(area["area_id"])}"{selected_attr(filters["area"], area["area_id"])}>{escape(area["name"])}</option>')
 
     matrix_cells = ['<div class="matrix-label"></div>']
     for consequence in range(1, 6):
         matrix_cells.append(f'<div class="matrix-label">C{consequence}</div>')
     todos_by_cell = {}
-    for todo in active_todos:
+    for todo in visible_todos:
         todos_by_cell.setdefault((int(todo["likelihood"]), int(todo["consequence"])), []).append(todo)
     for likelihood in range(5, 0, -1):
         matrix_cells.append(f'<div class="matrix-label">L{likelihood}</div>')
@@ -2605,6 +3534,37 @@ def render_todos_view(csrf_token, notice="", theme="system", base_path=""):
         <div class="stat"><strong>{summary["ready"]}</strong><span>Ready to start</span></div>
         <div class="stat"><strong>{summary["in_work"]}</strong><span>In work</span></div>
         <div class="stat"><strong>{summary["blocked"]}</strong><span>Blocked</span></div>
+      </section>
+      <section class="panel filter-panel">
+        <form action="{app_url("/todos", base_path)}" method="get">
+          <div class="filter-grid">
+            <div>
+              <label for="todo-q">Search</label>
+              <input id="todo-q" name="q" value="{escape(filters["q"])}" placeholder="Title, detail, area, lane">
+            </div>
+            <div>
+              <label for="todo-category">Category</label>
+              <select id="todo-category" name="category">{''.join(category_options)}</select>
+            </div>
+            <div>
+              <label for="todo-status">Status</label>
+              <select id="todo-status" name="status">{status_options_html}</select>
+            </div>
+            <div>
+              <label for="todo-risk">Risk</label>
+              <select id="todo-risk" name="risk">{''.join(risk_options)}</select>
+            </div>
+            <div>
+              <label for="todo-area">Area</label>
+              <select id="todo-area" name="area">{''.join(area_options)}</select>
+            </div>
+          </div>
+          <div class="filter-actions form-actions">
+            <button type="submit">Apply filters</button>
+            <a class="button secondary" href="{app_url("/todos", base_path)}">Clear</a>
+          </div>
+          <div class="result-count">{len(visible_todos)} of {len(todos)} house todos shown</div>
+        </form>
       </section>
       <section class="todo-board">
         <div class="todo-card-grid">{''.join(cards)}</div>
@@ -2663,7 +3623,7 @@ def render_calendar_view(csrf_token, query=None, notice="", theme="system", base
                     f"""
                     <a class="calendar-task {task["status"]}" href="{app_url(f"/item/{task["id"]}", base_path)}">
                       <strong>{escape(task["name"])}</strong>
-                      <div class="meta">{escape(task["category"])} · {escape(task["due_phrase"])}</div>
+                      <div class="meta">{escape(task["category"])} - {escape(task["due_phrase"])}</div>
                       {area}
                     </a>
                     """
@@ -2698,13 +3658,131 @@ def render_calendar_view(csrf_token, query=None, notice="", theme="system", base
     return render_layout("Maintenance Calendar", body, csrf_token, notice, theme, base_path, active_view="calendar")
 
 
-def render_items_audit(csrf_token, notice="", theme="system", base_path=""):
+def render_reports_view(csrf_token, query=None, notice="", theme="system", base_path=""):
+    report = annual_report(query_first(query or {}, "year"))
+    health = backup_health()
+    max_month = max(report["by_month"].values()) or 1
+    month_rows = []
+    for month in range(1, 13):
+        count = report["by_month"][month]
+        month_rows.append(
+            f"""
+            <div class="report-bar">
+              <strong>{calendar.month_abbr[month]}</strong>
+              <div class="bar-track"><div class="bar-fill" style="width: {round((count / max_month) * 100)}%"></div></div>
+              <span class="meta">{count}</span>
+            </div>
+            """
+        )
+    top_rows = []
+    for task_name, count in report["top_completed"]:
+        top_rows.append(f'<div class="history-item"><strong>{escape(task_name)}</strong><div>{count} completion{"s" if count != 1 else ""}</div></div>')
+    if not top_rows:
+        top_rows.append('<div class="empty">No completions recorded for this year.</div>')
+    recent_rows = []
+    for item in report["recent"]:
+        recent_rows.append(
+            f"""
+            <div class="history-item">
+              <strong>{escape(item["task_name"])}</strong>
+              <div>Completed {escape(item["completed_on"])} - Next due {escape(item["next_due_on"])}</div>
+            </div>
+            """
+        )
+    if not recent_rows:
+        recent_rows.append('<div class="empty">No annual history yet.</div>')
+    previous_year = report["year"] - 1
+    next_year = report["year"] + 1
+    body = f"""
+      <section class="grid" aria-label="Annual maintenance report">
+        <div class="stat"><strong>{report["completed"]}</strong><span>Completed in {report["year"]}</span></div>
+        <div class="stat"><strong>{report["overdue"]}</strong><span>Overdue now</span></div>
+        <div class="stat"><strong>{report["due_next_14"]}</strong><span>Due next 14 days</span></div>
+        <div class="stat"><strong>{report["never_completed"]}</strong><span>Never completed</span></div>
+        <div class="stat"><strong>{report["requires_supplies"]}</strong><span>Need supplies</span></div>
+        <div class="stat"><strong>{report["total_items"]}</strong><span>Total maintenance items</span></div>
+      </section>
+      <section class="layout">
+        <div class="panel">
+          <div class="calendar-toolbar">
+            <h2>{report["year"]} Completion Trend</h2>
+            <div class="actions">
+              <a class="button secondary" href="{app_url(f"/reports?year={previous_year}", base_path)}">Previous</a>
+              <a class="button secondary" href="{app_url("/reports", base_path)}">This year</a>
+              <a class="button secondary" href="{app_url(f"/reports?year={next_year}", base_path)}">Next</a>
+            </div>
+          </div>
+          <div class="report-bars">{''.join(month_rows)}</div>
+        </div>
+        <aside class="panel">
+          <h2>Most Completed</h2>
+          <div class="history">{''.join(top_rows)}</div>
+        </aside>
+      </section>
+      <section class="panel">
+        <h2>Recent Annual History</h2>
+        <div class="history">{''.join(recent_rows)}</div>
+      </section>
+      <section class="panel">
+        <div class="table-head">
+          <h2>Backup Health</h2>
+          <div class="meta">Schema and database integrity check</div>
+        </div>
+        <div class="detail-grid">
+          <div class="detail-field"><span>Status</span>{escape(health["status"].upper())}</div>
+          <div class="detail-field"><span>Version</span>{escape(health["version"])}</div>
+          <div class="detail-field"><span>Backup scope</span>{escape(health["backup_scope"])}</div>
+          <div class="detail-field"><span>Checked</span>{escape(health["checked_at"])}</div>
+        </div>
+        {f'<div class="errors">{"; ".join(escape(error) for error in health["errors"])}</div>' if health["errors"] else '<div class="notice">Backup health check passed.</div>'}
+      </section>
+    """
+    return render_layout("Maintenance Reports", body, csrf_token, notice, theme, base_path, active_view="reports")
+
+
+def render_ha_setup_view(csrf_token, notice="", theme="system", base_path=""):
+    examples = homeassistant_examples()
+    body = f"""
+      <section class="panel">
+        <div class="table-head">
+          <div>
+            <h2>Home Assistant Setup</h2>
+            <div class="meta">Rest commands and actionable notifications for native Home Assistant automations.</div>
+          </div>
+        </div>
+        <div class="detail-grid">
+          <div class="detail-field"><span>Action API</span>Token protected</div>
+          <div class="detail-field"><span>Internal URL</span>{escape(examples["addon_internal_url"])}</div>
+          <div class="detail-field"><span>Sensor</span>sensor.mxtracker_due_14_days</div>
+          <div class="detail-field"><span>Actions</span>Done, snooze, open detail</div>
+        </div>
+      </section>
+      <section class="panel">
+        <h2>secrets.yaml</h2>
+        <pre>{escape(examples["secrets_yaml"])}</pre>
+      </section>
+      <section class="panel">
+        <h2>configuration.yaml rest_command</h2>
+        <pre>{escape(examples["rest_command_yaml"])}</pre>
+      </section>
+      <section class="panel">
+        <h2>Actionable Notification Automation</h2>
+        <pre>{escape(examples["notification_automation_yaml"])}</pre>
+      </section>
+    """
+    return render_layout("Home Assistant Setup", body, csrf_token, notice, theme, base_path, active_view="ha_setup")
+
+
+def render_items_audit(csrf_token, query=None, notice="", theme="system", base_path=""):
     tasks = get_tasks()
-    if tasks:
+    visible_tasks, filters = filter_tasks(tasks, query or {})
+    if visible_tasks:
         rows = []
-        for task in tasks:
+        for task in visible_tasks:
             task_id = task["id"]
             notes = f'<div class="meta">{escape(task["notes"])}</div>' if task["notes"] else ""
+            asset = f'<div class="meta">{escape(task["asset_name"])}</div>' if task.get("asset_name") else ""
+            priority = f'<div class="meta">{escape(task["priority_label"])}</div>' if task.get("priority") != "normal" else ""
             area_name = task.get("ha_area_name") or "Unassigned"
             complete_url = app_url(f"/complete/{task_id}", base_path)
             edit_url = app_url(f"/edit/{task_id}", base_path)
@@ -2713,6 +3791,7 @@ def render_items_audit(csrf_token, notice="", theme="system", base_path=""):
                 <tr>
                   <td data-label="Task" class="col-name">
                     <strong><a href="{app_url(f"/item/{task_id}", base_path)}">{escape(task["name"])}</a></strong>
+                    {asset}
                     {notes}
                   </td>
                   <td data-label="Category" class="col-category">{escape(task["category"])}</td>
@@ -2720,6 +3799,7 @@ def render_items_audit(csrf_token, notice="", theme="system", base_path=""):
                   <td data-label="Status" class="col-due">
                     <span class="badge {task["status"]}">{escape(task["due_phrase"])}</span>
                     <div class="meta">{escape(task["status_label"])}</div>
+                    {priority}
                   </td>
                   <td data-label="Last done">{escape(task["last_completed_on"] or "Never")}</td>
                   <td data-label="Next due">{escape(task["next_due_on"])}</td>
@@ -2739,13 +3819,62 @@ def render_items_audit(csrf_token, notice="", theme="system", base_path=""):
             )
         table_body = "".join(rows)
     else:
-        table_body = '<tr><td colspan="8" class="empty">No maintenance items yet.</td></tr>'
+        table_body = '<tr><td colspan="8" class="empty">No maintenance items match these filters.</td></tr>'
+
+    category_options = ['<option value="">All categories</option>']
+    for category in CATEGORIES:
+        category_options.append(f'<option value="{escape(category)}"{selected_attr(filters["category"], category)}>{escape(category)}</option>')
+    status_options = [
+        ("", "All statuses"),
+        ("due_14", "Due next 14 days"),
+        ("overdue", "Overdue"),
+        ("due_today", "Due today"),
+        ("upcoming", "Upcoming"),
+        ("never_done", "Never completed"),
+        ("requires_supplies", "Requires supplies"),
+    ]
+    status_options_html = "".join(
+        f'<option value="{status}"{selected_attr(filters["status"], status)}>{escape(label)}</option>'
+        for status, label in status_options
+    )
+    area_options = [f'<option value=""{selected_attr(filters["area"], "")}>All areas</option>']
+    area_options.append(f'<option value="unassigned"{selected_attr(filters["area"], "unassigned")}>Unassigned</option>')
+    for area in get_homeassistant_areas():
+        area_options.append(f'<option value="{escape(area["area_id"])}"{selected_attr(filters["area"], area["area_id"])}>{escape(area["name"])}</option>')
 
     body = f"""
       <div class="audit-actions">
         <a class="button" href="{app_url("/export/tasks.csv", base_path)}">Export items CSV</a>
         <a class="button secondary" href="{app_url("/export/history.csv", base_path)}">Export history CSV</a>
+        <a class="button secondary" href="{app_url("/export/events.csv", base_path)}">Export lifecycle CSV</a>
       </div>
+      <section class="panel filter-panel">
+        <form action="{app_url("/items", base_path)}" method="get">
+          <div class="filter-grid">
+            <div>
+              <label for="task-q">Search</label>
+              <input id="task-q" name="q" value="{escape(filters["q"])}" placeholder="Task, notes, category, area">
+            </div>
+            <div>
+              <label for="task-category">Category</label>
+              <select id="task-category" name="category">{''.join(category_options)}</select>
+            </div>
+            <div>
+              <label for="task-status">Status</label>
+              <select id="task-status" name="status">{status_options_html}</select>
+            </div>
+            <div>
+              <label for="task-area">Area</label>
+              <select id="task-area" name="area">{''.join(area_options)}</select>
+            </div>
+          </div>
+          <div class="filter-actions form-actions">
+            <button type="submit">Apply filters</button>
+            <a class="button secondary" href="{app_url("/items", base_path)}">Clear</a>
+          </div>
+          <div class="result-count">{len(visible_tasks)} of {len(tasks)} maintenance items shown</div>
+        </form>
+      </section>
       <section class="panel table-panel">
         <div class="table-head">
           <h2>All Items</h2>
@@ -2768,11 +3897,13 @@ def render_items_audit(csrf_token, notice="", theme="system", base_path=""):
         </table>
       </section>
     """
-    return render_layout("All Maintenance Items", body, csrf_token, notice, theme, base_path, active_view="items")
+    return render_layout("Maintenance Audit", body, csrf_token, notice, theme, base_path, active_view="audit")
 
 
 def render_item_detail(task, csrf_token, notice="", theme="system", base_path=""):
     history = get_task_history(task["id"])
+    checklist = get_task_checklist(task["id"])
+    events = get_task_events(task["id"])
     history_count = len(history)
     status_class = " overdue" if task["status"] == "overdue" else ""
     area_name = task.get("ha_area_name") or "Unassigned"
@@ -2781,6 +3912,26 @@ def render_item_detail(task, csrf_token, notice="", theme="system", base_path=""
     edit_url = app_url(f"/edit/{task['id']}", base_path)
     delete_url = f'{app_url(f"/delete/{task["id"]}", base_path)}?return_to={quote(f"/item/{task["id"]}", safe="")}'
     return_to = f"/item/{task['id']}"
+    checklist_items = []
+    for item in checklist:
+        checked = " checked" if item["is_done"] else ""
+        done_class = " done" if item["is_done"] else ""
+        checklist_items.append(
+            f"""
+            <div class="check-item{done_class}">
+              <form class="inline" action="{app_url(f"/item/checklist/{item["id"]}/toggle", base_path)}" method="post">
+                <input type="hidden" name="csrf_token" value="{csrf_token}">
+                <input type="checkbox" aria-label="Toggle {escape(item["label"])}" onchange="this.form.submit()"{checked}>
+              </form>
+              <div><strong>{escape(item["label"])}</strong></div>
+              <form class="inline" action="{app_url(f"/item/checklist/{item["id"]}/delete", base_path)}" method="post">
+                <input type="hidden" name="csrf_token" value="{csrf_token}">
+                <button class="secondary" type="submit">Remove</button>
+              </form>
+            </div>
+            """
+        )
+    checklist_html = "".join(checklist_items) if checklist_items else '<div class="empty">No checklist steps yet.</div>'
 
     if history:
         history_rows = []
@@ -2797,6 +3948,26 @@ def render_item_detail(task, csrf_token, notice="", theme="system", base_path=""
         history_body = "".join(history_rows)
     else:
         history_body = '<tr><td colspan="3" class="empty">No completions recorded yet.</td></tr>'
+    event_items = []
+    for event in events:
+        data = event.get("event_data_json") or {}
+        details = []
+        if "changed" in data and data["changed"]:
+            details.append("Changed " + ", ".join(str(item) for item in data["changed"][:8]))
+        for key in ["completed_on", "next_due_on", "from", "to", "days", "label"]:
+            if key in data and data[key] not in ("", None, []):
+                details.append(f"{key.replace('_', ' ')}: {data[key]}")
+        event_items.append(
+            f"""
+            <div class="history-item">
+              <strong>{escape(event_type_label(event["event_type"]))}</strong>
+              <div>{escape(event["created_at"])}</div>
+              {f'<div>{escape("; ".join(details))}</div>' if details else ''}
+            </div>
+            """
+        )
+    if not event_items:
+        event_items.append('<div class="empty">No lifecycle events yet.</div>')
 
     notes = f'<p class="notes">{escape(task["notes"])}</p>' if task["notes"] else '<p class="empty">No notes saved for this item.</p>'
     body = f"""
@@ -2804,24 +3975,48 @@ def render_item_detail(task, csrf_token, notice="", theme="system", base_path=""
         <div class="table-head">
           <div>
             <h2>{escape(task["name"])}</h2>
-            <div class="meta">{escape(task["category"])} · {escape(area_name)}</div>
+            <div class="meta">{escape(task["category"])} - {escape(area_name)}</div>
           </div>
           <span class="badge {task["status"]}">{escape(task["due_phrase"])}</span>
         </div>
         <div class="detail-grid">
           <div class="detail-field"><span>Category</span>{escape(task["category"])}</div>
           <div class="detail-field"><span>Home Assistant area</span>{escape(area_name)}</div>
+          <div class="detail-field"><span>Asset</span>{escape(task.get("asset_name") or "Not set")}</div>
+          <div class="detail-field"><span>Location</span>{escape(task.get("location") or "Not set")}</div>
           <div class="detail-field"><span>Status</span>{escape(task["status_label"])}</div>
           <div class="detail-field"><span>Next due</span>{escape(task["next_due_on"])}</div>
           <div class="detail-field"><span>Due timing</span>{escape(task["due_phrase"])}</div>
           <div class="detail-field"><span>Last done</span>{escape(task["last_completed_on"] or "Never")}</div>
           <div class="detail-field"><span>Repeat</span>{escape(task["recurrence_phrase"])}</div>
+          <div class="detail-field"><span>Priority</span>{escape(task["priority_label"])}</div>
+          <div class="detail-field"><span>Season</span>{escape(task["season_label"])}</div>
+          <div class="detail-field"><span>Requires supplies</span>{"Yes" if task.get("requires_supplies") else "No"}</div>
+          <div class="detail-field"><span>Estimated time</span>{escape(task.get("estimated_minutes") or 0)} min</div>
+          <div class="detail-field"><span>Model</span>{escape(task.get("model_number") or "Not set")}</div>
+          <div class="detail-field"><span>Serial</span>{escape(task.get("serial_number") or "Not set")}</div>
+          <div class="detail-field"><span>Filter/part</span>{escape(task.get("filter_size") or "Not set")}</div>
+          <div class="detail-field"><span>Warranty</span>{escape(task.get("warranty_expires_on") or "Not set")}</div>
           <div class="detail-field"><span>Times completed</span>{history_count}</div>
           <div class="detail-field"><span>Created</span>{escape(task["created_at"])}</div>
           <div class="detail-field"><span>Updated</span>{escape(task["updated_at"])}</div>
         </div>
         <h2>Details</h2>
         {notes}
+        <div class="detail-section">
+          <div class="table-head">
+            <div>
+              <h2>Checklist</h2>
+              <div class="meta">Reusable steps for this recurring maintenance item.</div>
+            </div>
+          </div>
+          <div class="checklist">{checklist_html}</div>
+          <form class="mini-form" action="{app_url(f"/item/{task["id"]}/checklist", base_path)}" method="post">
+            <input type="hidden" name="csrf_token" value="{csrf_token}">
+            <input name="label" maxlength="180" placeholder="Add maintenance step">
+            <button type="submit">Add step</button>
+          </form>
+        </div>
         <div class="actions form-actions">
           <form class="inline" action="{complete_url}" method="post">
             <input type="hidden" name="csrf_token" value="{csrf_token}">
@@ -2853,8 +4048,15 @@ def render_item_detail(task, csrf_token, notice="", theme="system", base_path=""
           <tbody>{history_body}</tbody>
         </table>
       </section>
+      <section class="panel">
+        <div class="table-head">
+          <h2>Lifecycle Events</h2>
+          <div class="meta">Create, edit, completion, snooze, and checklist audit trail</div>
+        </div>
+        <div class="history">{''.join(event_items)}</div>
+      </section>
     """
-    return render_layout(task["name"], body, csrf_token, notice, theme, base_path, active_view="items")
+    return render_layout(task["name"], body, csrf_token, notice, theme, base_path, active_view="audit")
 
 
 def render_todo_detail(todo, csrf_token, notice="", theme="system", base_path=""):
@@ -2916,7 +4118,7 @@ def render_todo_detail(todo, csrf_token, notice="", theme="system", base_path=""
         <div class="table-head">
           <div>
             <h2>{escape(todo["title"])}</h2>
-            <div class="meta">{escape(todo["category"])} · {escape(area_name)}</div>
+            <div class="meta">{escape(todo["category"])} - {escape(area_name)}</div>
           </div>
           <span class="score-pill">{escape(todo["priority_score"])}</span>
         </div>
@@ -3017,7 +4219,7 @@ def render_todo_form(csrf_token, todo=None, errors=None, theme="system", base_pa
           <div>
             <label for="{name}">{label}</label>
             <select id="{name}" name="{name}">{''.join(options)}</select>
-            <div class="meta">{escape(low)} → {escape(high)}</div>
+            <div class="meta">{escape(low)} to {escape(high)}</div>
           </div>
         """
 
@@ -3095,6 +4297,18 @@ def render_task_form(csrf_token, task=None, errors=None, theme="system", base_pa
         "notes": "",
         "ha_area_id": "",
         "ha_area_name": "",
+        "asset_name": "",
+        "location": "",
+        "model_number": "",
+        "serial_number": "",
+        "filter_size": "",
+        "purchase_date": "",
+        "warranty_expires_on": "",
+        "priority": "normal",
+        "season": "",
+        "tags": "",
+        "requires_supplies": 0,
+        "estimated_minutes": 0,
         "interval_count": 1,
         "interval_unit": "months",
         "next_due_on": today_iso(),
@@ -3122,6 +4336,13 @@ def render_task_form(csrf_token, task=None, errors=None, theme="system", base_pa
     if selected_area_id and selected_area_id not in known_area_ids:
         selected_name = values["ha_area_name"] or selected_area_id
         area_options.append(f'<option value="{escape(selected_area_id)}" selected>{escape(selected_name)}</option>')
+    priority_options = []
+    for priority in ["low", "normal", "high", "critical"]:
+        priority_options.append(f'<option value="{priority}"{selected_attr(values.get("priority", "normal"), priority)}>{PRIORITY_LABELS[priority]}</option>')
+    season_options = []
+    for season in ["", "spring", "summer", "fall", "winter", "year_round"]:
+        season_options.append(f'<option value="{season}"{selected_attr(values.get("season", ""), season)}>{SEASON_LABELS[season]}</option>')
+    checked_supplies = " checked" if values.get("requires_supplies") else ""
     error_html = ""
     if errors:
         error_html = '<div class="errors"><strong>Check these fields:</strong><ul>'
@@ -3140,6 +4361,59 @@ def render_task_form(csrf_token, task=None, errors=None, theme="system", base_pa
           <label for="ha_area_id">Home Assistant area</label>
           <select id="ha_area_id" name="ha_area_id">{''.join(area_options)}</select>
           <input type="hidden" name="ha_area_name" value="{escape(values["ha_area_name"])}">
+          <div class="form-row">
+            <div>
+              <label for="asset_name">Asset</label>
+              <input id="asset_name" name="asset_name" maxlength="120" value="{escape(values.get("asset_name", ""))}" placeholder="HVAC unit, dishwasher, gutters">
+            </div>
+            <div>
+              <label for="location">Location</label>
+              <input id="location" name="location" maxlength="120" value="{escape(values.get("location", ""))}" placeholder="Basement, kitchen, garage">
+            </div>
+          </div>
+          <div class="form-row">
+            <div>
+              <label for="model_number">Model number</label>
+              <input id="model_number" name="model_number" maxlength="120" value="{escape(values.get("model_number", ""))}">
+            </div>
+            <div>
+              <label for="serial_number">Serial number</label>
+              <input id="serial_number" name="serial_number" maxlength="120" value="{escape(values.get("serial_number", ""))}">
+            </div>
+          </div>
+          <div class="form-row">
+            <div>
+              <label for="filter_size">Filter or part size</label>
+              <input id="filter_size" name="filter_size" maxlength="80" value="{escape(values.get("filter_size", ""))}">
+            </div>
+            <div>
+              <label for="estimated_minutes">Estimated minutes</label>
+              <input id="estimated_minutes" name="estimated_minutes" type="number" min="0" max="10080" value="{escape(values.get("estimated_minutes", 0))}">
+            </div>
+          </div>
+          <div class="form-row">
+            <div>
+              <label for="purchase_date">Purchase date</label>
+              <input id="purchase_date" name="purchase_date" type="date" value="{escape(values.get("purchase_date", ""))}">
+            </div>
+            <div>
+              <label for="warranty_expires_on">Warranty expires</label>
+              <input id="warranty_expires_on" name="warranty_expires_on" type="date" value="{escape(values.get("warranty_expires_on", ""))}">
+            </div>
+          </div>
+          <div class="form-row">
+            <div>
+              <label for="priority">Priority</label>
+              <select id="priority" name="priority">{''.join(priority_options)}</select>
+            </div>
+            <div>
+              <label for="season">Season</label>
+              <select id="season" name="season">{''.join(season_options)}</select>
+            </div>
+          </div>
+          <label for="tags">Tags</label>
+          <input id="tags" name="tags" maxlength="200" value="{escape(values.get("tags", ""))}" placeholder="supplies, ladder, outside">
+          <label><input type="checkbox" name="requires_supplies" value="1"{checked_supplies}> Requires supplies</label>
           <label for="notes">Notes</label>
           <textarea id="notes" name="notes" maxlength="1000">{escape(values["notes"])}</textarea>
           <div class="form-row">
@@ -3161,7 +4435,7 @@ def render_task_form(csrf_token, task=None, errors=None, theme="system", base_pa
         </form>
       </section>
     """
-    return render_layout(title, body, csrf_token, theme=theme, base_path=base_path, active_view="new" if not is_edit else "items")
+    return render_layout(title, body, csrf_token, theme=theme, base_path=base_path, active_view="new" if not is_edit else "audit")
 
 
 def render_delete_confirm(task, csrf_token, return_to="/", theme="system", base_path=""):
@@ -3174,7 +4448,7 @@ def render_delete_confirm(task, csrf_token, return_to="/", theme="system", base_
         <p class="meta">This removes the maintenance item and its future schedule.</p>
         <div class="task confirm-card">
           <h3>{escape(task["name"])}</h3>
-          <div class="meta">{escape(category)} · {escape(recurrence)}</div>
+          <div class="meta">{escape(category)} - {escape(recurrence)}</div>
         </div>
         <div class="actions form-actions">
           <form class="inline" action="{delete_url}" method="post">
@@ -3186,7 +4460,7 @@ def render_delete_confirm(task, csrf_token, return_to="/", theme="system", base_
         </div>
       </section>
     """
-    return render_layout("Delete Maintenance Item", body, csrf_token, theme=theme, base_path=base_path, active_view="items")
+    return render_layout("Delete Maintenance Item", body, csrf_token, theme=theme, base_path=base_path, active_view="audit")
 
 
 class MaintenanceHandler(BaseHTTPRequestHandler):
@@ -3217,12 +4491,14 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
             self.respond_html(render_root_page(query, csrf, notice=notice, theme=theme, base_path=base_path), csrf)
             return
         if parsed.path == "/items":
-            notice = parse_qs(parsed.query).get("notice", [""])[0]
-            self.respond_html(render_items_audit(csrf, notice=notice, theme=theme, base_path=base_path), csrf)
+            query = parse_qs(parsed.query)
+            notice = query.get("notice", [""])[0]
+            self.respond_html(render_items_audit(csrf, query=query, notice=notice, theme=theme, base_path=base_path), csrf)
             return
         if parsed.path == "/todos":
-            notice = parse_qs(parsed.query).get("notice", [""])[0]
-            self.respond_html(render_todos_view(csrf, notice=notice, theme=theme, base_path=base_path), csrf)
+            query = parse_qs(parsed.query)
+            notice = query.get("notice", [""])[0]
+            self.respond_html(render_todos_view(csrf, query=query, notice=notice, theme=theme, base_path=base_path), csrf)
             return
         if parsed.path == "/todo/new":
             self.respond_html(render_todo_form(csrf, theme=theme, base_path=base_path), csrf)
@@ -3257,6 +4533,15 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             notice = query.get("notice", [""])[0]
             self.respond_html(render_calendar_view(csrf, query=query, notice=notice, theme=theme, base_path=base_path), csrf)
+            return
+        if parsed.path == "/reports":
+            query = parse_qs(parsed.query)
+            notice = query.get("notice", [""])[0]
+            self.respond_html(render_reports_view(csrf, query=query, notice=notice, theme=theme, base_path=base_path), csrf)
+            return
+        if parsed.path == "/ha-setup":
+            notice = parse_qs(parsed.query).get("notice", [""])[0]
+            self.respond_html(render_ha_setup_view(csrf, notice=notice, theme=theme, base_path=base_path), csrf)
             return
         if parsed.path == "/focus":
             notice = parse_qs(parsed.query).get("notice", [""])[0]
@@ -3303,11 +4588,23 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/areas":
             self.respond_json({"areas": get_homeassistant_areas()})
             return
+        if parsed.path == "/api/report":
+            self.respond_json({"report": annual_report(parse_qs(parsed.query).get("year", [""])[0])})
+            return
+        if parsed.path == "/api/backup/health":
+            self.respond_json({"backup": backup_health()})
+            return
+        if parsed.path == "/api/homeassistant/examples":
+            self.respond_json({"examples": homeassistant_examples()})
+            return
         if parsed.path == "/export/tasks.csv":
             self.respond_csv(tasks_csv(), "mxtracker-maintenance-items.csv")
             return
         if parsed.path == "/export/history.csv":
             self.respond_csv(history_csv(), "mxtracker-maintenance-history.csv")
+            return
+        if parsed.path == "/export/events.csv":
+            self.respond_csv(events_csv(), "mxtracker-lifecycle-events.csv")
             return
         if parsed.path == "/health":
             self.respond_json({"status": "ok"})
@@ -3320,6 +4617,22 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
             return
         parsed = urlparse(self.path)
         content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if parsed.path.startswith("/api/actions/"):
+            if content_type != "application/json":
+                self.respond_json({"ok": False, "error": "Unsupported media type."}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+                return
+            if not self.valid_api_action_token():
+                self.respond_json({"ok": False, "error": "API action token is not configured or invalid."}, HTTPStatus.FORBIDDEN)
+                return
+            try:
+                payload = self.read_json()
+            except ValueError as error:
+                self.respond_json({"ok": False, "error": str(error)}, HTTPStatus.BAD_REQUEST)
+                return
+            action = parsed.path.removeprefix("/api/actions/").strip("/")
+            status, response = handle_api_action(action, payload, self.base_path())
+            self.respond_json(response, status)
+            return
         if content_type != "application/x-www-form-urlencoded":
             self.respond_text("Unsupported media type.", HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
             return
@@ -3374,6 +4687,29 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
                 self.redirect(f"/todo/{project_id}", "Checklist item added.")
             else:
                 self.redirect(f"/todo/{project_id}", "Checklist item could not be added.")
+            return
+        if parsed.path.startswith("/item/") and parsed.path.endswith("/checklist"):
+            task_id = self.extract_id(parsed.path.removesuffix("/checklist"), "/item/")
+            if task_id and add_task_checklist_item(task_id, fields.get("label", "")):
+                self.redirect(f"/item/{task_id}", "Checklist step added.")
+            else:
+                self.redirect(f"/item/{task_id or ''}", "Checklist step could not be added.")
+            return
+        if parsed.path.startswith("/item/checklist/") and parsed.path.endswith("/toggle"):
+            item_id = self.extract_id(parsed.path.removesuffix("/toggle"), "/item/checklist/")
+            task_id = toggle_task_checklist_item(item_id) if item_id else None
+            if task_id:
+                self.redirect(f"/item/{task_id}", "Checklist updated.")
+            else:
+                self.redirect("/", "Checklist step not found.")
+            return
+        if parsed.path.startswith("/item/checklist/") and parsed.path.endswith("/delete"):
+            item_id = self.extract_id(parsed.path.removesuffix("/delete"), "/item/checklist/")
+            task_id = delete_task_checklist_item(item_id) if item_id else None
+            if task_id:
+                self.redirect(f"/item/{task_id}", "Checklist step removed.")
+            else:
+                self.redirect("/", "Checklist step not found.")
             return
         if parsed.path.startswith("/todo/checklist/") and parsed.path.endswith("/toggle"):
             item_id = self.extract_id(parsed.path.removesuffix("/toggle"), "/todo/checklist/")
@@ -3453,6 +4789,26 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
         parsed = parse_qs(raw, keep_blank_values=True)
         return {key: values[0] for key, values in parsed.items()}
 
+    def read_json(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as error:
+            raise ValueError("Invalid content length.") from error
+        if length < 0:
+            raise ValueError("Invalid content length.")
+        if length > MAX_FORM_BYTES:
+            raise ValueError("JSON payload is too large.")
+        try:
+            raw = self.rfile.read(length).decode("utf-8")
+            payload = json.loads(raw or "{}")
+        except UnicodeDecodeError as error:
+            raise ValueError("JSON payload must be UTF-8.") from error
+        except json.JSONDecodeError as error:
+            raise ValueError("JSON payload must be valid.") from error
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object.")
+        return payload
+
     def extract_id(self, path, prefix):
         try:
             value = path.removeprefix(prefix).strip("/")
@@ -3480,6 +4836,16 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
             return False
         return secrets.compare_digest(morsel.value, submitted)
 
+    def valid_api_action_token(self):
+        if not API_ACTION_TOKEN or not valid_csrf_token_value(API_ACTION_TOKEN):
+            return False
+        token = self.headers.get("X-MxTracker-Token", "").strip()
+        if not token:
+            authorization = self.headers.get("Authorization", "")
+            if authorization.startswith("Bearer "):
+                token = authorization.removeprefix("Bearer ").strip()
+        return valid_csrf_token_value(token) and secrets.compare_digest(API_ACTION_TOKEN, token)
+
     def current_theme(self):
         cookie = SimpleCookie(self.headers.get("Cookie"))
         morsel = cookie.get(THEME_COOKIE)
@@ -3488,6 +4854,8 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
     def set_security_headers(self):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        self.send_header("X-Frame-Options", "SAMEORIGIN")
         self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; form-action 'self'; frame-ancestors 'self'")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Pragma", "no-cache")
