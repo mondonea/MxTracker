@@ -59,7 +59,7 @@ CSRF_COOKIE = "hm_csrf"
 THEME_COOKIE = "hm_theme"
 ADMIN_COOKIE = "hm_admin"
 THEMES = {"system", "light", "dark"}
-APP_VERSION = "2.0.5"
+APP_VERSION = "2.0.6"
 MAX_FORM_BYTES = 16 * 1024
 ADMIN_SESSION_SECONDS = 15 * 60
 CSRF_TOKEN_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
@@ -3338,6 +3338,90 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
     .audit-table .col-date {{ width: 120px; }}
     .audit-table .col-repeat {{ width: 130px; }}
     .audit-table .col-actions {{ width: 170px; }}
+    .admin-records {{
+      display: grid;
+      gap: 12px;
+      padding: 12px 18px 18px;
+    }}
+    .admin-record {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+      padding: 14px;
+    }}
+    .admin-record-head {{
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--line);
+    }}
+    .admin-record-title {{
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }}
+    .admin-record-meta {{
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 5px;
+    }}
+    .admin-record-notes {{
+      margin: 10px 0 0;
+      color: var(--muted);
+      overflow-wrap: anywhere;
+    }}
+    .admin-forms {{
+      display: grid;
+      grid-template-columns: minmax(0, 1.4fr) minmax(240px, .8fr);
+      gap: 14px;
+      margin-top: 12px;
+      align-items: start;
+    }}
+    .admin-form-grid {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(120px, 1fr));
+      gap: 10px;
+      align-items: end;
+    }}
+    .admin-form-grid label,
+    .admin-repair-actions label {{
+      margin: 0;
+      font-size: .84rem;
+    }}
+    .admin-form-grid input,
+    .admin-form-grid select,
+    .admin-repair-actions input {{
+      min-height: 38px;
+      margin-top: 4px;
+      padding: 7px 9px;
+    }}
+    .admin-edit-form textarea {{
+      min-height: 74px;
+      margin-top: 4px;
+    }}
+    .admin-notes-field {{
+      grid-column: 1 / -1;
+    }}
+    .admin-repair-actions {{
+      display: grid;
+      gap: 10px;
+      padding-left: 14px;
+      border-left: 1px solid var(--line);
+    }}
+    .admin-repair-actions form {{
+      display: grid;
+      gap: 8px;
+    }}
+    .admin-repair-actions .button,
+    .admin-repair-actions button,
+    .admin-edit-form button {{
+      min-height: 38px;
+      padding: 7px 10px;
+    }}
     .quick-actions {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }}
     .quick-actions form {{ min-width: 0; }}
     .quick-actions .button, .quick-actions button {{ min-height: 34px; padding: 6px 9px; font-size: .9rem; }}
@@ -3531,6 +3615,13 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
       .todo-toolbar {{ align-items: stretch; flex-direction: column; }}
       .todo-toolbar .actions, .todo-toolbar .button {{ width: 100%; }}
       .filter-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .admin-forms {{ grid-template-columns: 1fr; }}
+      .admin-repair-actions {{
+        border-left: 0;
+        border-top: 1px solid var(--line);
+        padding-left: 0;
+        padding-top: 12px;
+      }}
       .scale-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .task-table, .task-table tbody, .task-table tr, .task-table td {{ display: block; width: 100%; max-width: 100%; }}
       .task-table thead {{ display: none; }}
@@ -3612,6 +3703,8 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
       .todo-card {{ grid-template-columns: 1fr; }}
       .mini-form {{ grid-template-columns: 1fr; }}
       .filter-grid {{ grid-template-columns: 1fr; }}
+      .admin-form-grid {{ grid-template-columns: 1fr; }}
+      .admin-record-head {{ flex-direction: column; }}
       .filter-actions .button, .filter-actions button {{ width: 100%; }}
       .check-item.child {{ margin-left: 12px; }}
       .risk-matrix {{ grid-template-columns: 34px repeat(5, minmax(46px, 1fr)); overflow-x: auto; }}
@@ -4207,75 +4300,81 @@ def render_admin_view(csrf_token, admin_enabled=False, notice="", theme="system"
         """
         return render_layout("Admin Mode", body, csrf_token, notice, theme, base_path, active_view="admin")
 
-    rows = []
+    history_cards = []
+    latest_history_task_ids = set()
+    for item in get_all_history():
+        latest_history_task_ids.add(item["task_id"])
     for item in get_all_history()[:100]:
         confirm_phrase = f"REMOVE {item['public_id']}"
+        reopen_phrase = f"REOPEN {item['task_public_id']}"
         closure_options = "".join(
             f'<option value="{key}"{" selected" if key == item["closure_type"] else ""}>{escape(label)}</option>'
             for key, label in CLOSURE_LABELS.items()
         )
-        rows.append(
+        reopen_form = ""
+        if item["task_id"] in latest_history_task_ids:
+            latest_history_task_ids.remove(item["task_id"])
+            reopen_form = f"""
+              <form action="{app_url(f"/admin/task/reopen/{item["task_id"]}", base_path)}" method="post">
+                <input type="hidden" name="csrf_token" value="{csrf_token}">
+                <label for="reopen-task-{item["id"]}">Reopen task</label>
+                <input id="reopen-task-{item["id"]}" name="confirm_text" autocomplete="off" required placeholder="{escape(reopen_phrase)}">
+                <button class="secondary" type="submit">Reopen maintenance</button>
+              </form>
+            """
+        notes = f'<div class="admin-record-notes">Notes: {escape(item["closure_notes"])}</div>' if item["closure_notes"] else ""
+        history_cards.append(
             f"""
-            <tr>
-              <td data-label="ID" class="col-id">{id_badge(item["public_id"])}</td>
-              <td data-label="Task" class="col-name">
-                <strong>{escape(item["task_name"])}</strong>
-                <div class="meta">{escape(item["task_public_id"])}</div>
-              </td>
-              <td data-label="Type" class="col-category">{escape(item["closure_label"])}</td>
-              <td data-label="Closed" class="col-date">{escape(item["completed_on"])}</td>
-              <td data-label="Next due" class="col-date">{escape(item["next_due_on"])}</td>
-              <td data-label="Notes" class="col-name">{escape(item["closure_notes"])}</td>
-              <td data-label="Actions" class="col-actions">
-                <form action="{app_url(f"/admin/history/edit/{item["id"]}", base_path)}" method="post">
+            <article class="admin-record">
+              <div class="admin-record-head">
+                <div>
+                  <div class="admin-record-title">
+                    {id_badge(item["public_id"])}
+                    <strong>{escape(item["task_name"])}</strong>
+                  </div>
+                  <div class="admin-record-meta">
+                    <span>{escape(item["task_public_id"])}</span>
+                    <span>{escape(item["closure_label"])}</span>
+                    <span>Closed {escape(item["completed_on"])}</span>
+                    <span>Next due {escape(item["next_due_on"])}</span>
+                  </div>
+                  {notes}
+                </div>
+                <span class="badge {item["closure_type"]}">{escape(item["closure_label"])}</span>
+              </div>
+              <div class="admin-forms">
+                <form class="admin-edit-form" action="{app_url(f"/admin/history/edit/{item["id"]}", base_path)}" method="post">
                   <input type="hidden" name="csrf_token" value="{csrf_token}">
-                  <label for="completed-{item["id"]}">Closed date</label>
-                  <input id="completed-{item["id"]}" type="date" name="completed_on" value="{escape(item["completed_on"])}" required>
-                  <label for="next-due-{item["id"]}">Next due</label>
-                  <input id="next-due-{item["id"]}" type="date" name="next_due_on" value="{escape(item["next_due_on"])}" required>
-                  <label for="closure-type-{item["id"]}">Closure type</label>
-                  <select id="closure-type-{item["id"]}" name="closure_type">{closure_options}</select>
-                  <label for="closure-notes-{item["id"]}">Closure notes</label>
-                  <textarea id="closure-notes-{item["id"]}" name="closure_notes" maxlength="1000">{escape(item["closure_notes"])}</textarea>
-                  <button class="secondary" type="submit">Save closure fields</button>
+                  <div class="admin-form-grid">
+                    <label for="completed-{item["id"]}">Closed date
+                      <input id="completed-{item["id"]}" type="date" name="completed_on" value="{escape(item["completed_on"])}" required>
+                    </label>
+                    <label for="next-due-{item["id"]}">Next due
+                      <input id="next-due-{item["id"]}" type="date" name="next_due_on" value="{escape(item["next_due_on"])}" required>
+                    </label>
+                    <label for="closure-type-{item["id"]}">Closure type
+                      <select id="closure-type-{item["id"]}" name="closure_type">{closure_options}</select>
+                    </label>
+                    <label class="admin-notes-field" for="closure-notes-{item["id"]}">Closure notes
+                      <textarea id="closure-notes-{item["id"]}" name="closure_notes" maxlength="1000">{escape(item["closure_notes"])}</textarea>
+                    </label>
+                    <button class="secondary" type="submit">Save closure fields</button>
+                  </div>
                 </form>
-                <form action="{app_url(f"/admin/history/delete/{item["id"]}", base_path)}" method="post">
-                  <input type="hidden" name="csrf_token" value="{csrf_token}">
-                  <label for="confirm-{item["id"]}">Type {escape(confirm_phrase)}</label>
-                  <input id="confirm-{item["id"]}" name="confirm_text" autocomplete="off" required placeholder="{escape(confirm_phrase)}">
-                  <button class="danger confirm-danger" type="submit">{trash_icon()} Remove completion</button>
-                </form>
-              </td>
-            </tr>
+                <div class="admin-repair-actions">
+                  {reopen_form}
+                  <form action="{app_url(f"/admin/history/delete/{item["id"]}", base_path)}" method="post">
+                    <input type="hidden" name="csrf_token" value="{csrf_token}">
+                    <label for="confirm-{item["id"]}">Remove completion</label>
+                    <input id="confirm-{item["id"]}" name="confirm_text" autocomplete="off" required placeholder="{escape(confirm_phrase)}">
+                    <button class="danger confirm-danger" type="submit">{trash_icon()} Remove completion</button>
+                  </form>
+                </div>
+              </div>
+            </article>
             """
         )
-    table_body = "".join(rows) if rows else '<tr><td colspan="7" class="empty">No completion history to repair.</td></tr>'
-    maintenance_rows = []
-    closed_tasks = [task for task in get_tasks() if get_task_history(task["id"], limit=1)]
-    for task in closed_tasks:
-        confirm_phrase = f"REOPEN {task['public_id']}"
-        maintenance_rows.append(
-            f"""
-            <tr>
-              <td data-label="ID" class="col-id">{id_badge(task["public_id"])}</td>
-              <td data-label="Task" class="col-name">
-                <strong>{escape(task["name"])}</strong>
-                <div class="meta">{escape(task["category"])}</div>
-              </td>
-              <td data-label="Last done" class="col-date">{escape(task["last_completed_on"] or "Never")}</td>
-              <td data-label="Next due" class="col-date">{escape(task["next_due_on"])}</td>
-              <td data-label="Actions" class="col-actions">
-                <form action="{app_url(f"/admin/task/reopen/{task["id"]}", base_path)}" method="post">
-                  <input type="hidden" name="csrf_token" value="{csrf_token}">
-                  <label for="reopen-task-{task["id"]}">Type {escape(confirm_phrase)}</label>
-                  <input id="reopen-task-{task["id"]}" name="confirm_text" autocomplete="off" required placeholder="{escape(confirm_phrase)}">
-                  <button class="secondary" type="submit">Reopen maintenance item</button>
-                </form>
-              </td>
-            </tr>
-            """
-        )
-    maintenance_body = "".join(maintenance_rows) if maintenance_rows else '<tr><td colspan="5" class="empty">No maintenance items to reopen.</td></tr>'
+    history_body = "".join(history_cards) if history_cards else '<div class="empty">No maintenance history to repair.</div>'
     todo_rows = []
     closed_todos = [todo for todo in get_todos() if todo["derived_status"] == "done"]
     for todo in closed_todos:
@@ -4318,45 +4417,10 @@ def render_admin_view(csrf_token, admin_enabled=False, notice="", theme="system"
       </section>
       <section class="panel table-panel">
         <div class="table-head">
-          <h2>Completion History Repair</h2>
-          <div class="meta">Newest records first</div>
+          <h2>Maintenance History Repair</h2>
+          <div class="meta">Edit a closure, remove a mistaken completion, or reopen the item from its latest record.</div>
         </div>
-        <div class="table-scroll">
-          <table class="task-table audit-table">
-            <thead>
-              <tr>
-                <th class="col-id">ID</th>
-                <th class="col-name">Task</th>
-                <th class="col-category">Type</th>
-                <th class="col-date">Closed</th>
-                <th class="col-date">Next due</th>
-                <th class="col-name">Notes</th>
-                <th class="col-actions">Actions</th>
-              </tr>
-            </thead>
-            <tbody>{table_body}</tbody>
-          </table>
-        </div>
-      </section>
-      <section class="panel table-panel">
-        <div class="table-head">
-          <h2>Reopen Maintenance</h2>
-          <div class="meta">Keeps history, moves next due to today, and clears checklist steps.</div>
-        </div>
-        <div class="table-scroll">
-          <table class="task-table audit-table">
-            <thead>
-              <tr>
-                <th class="col-id">ID</th>
-                <th class="col-name">Item</th>
-                <th class="col-date">Last done</th>
-                <th class="col-date">Next due</th>
-                <th class="col-actions">Actions</th>
-              </tr>
-            </thead>
-            <tbody>{maintenance_body}</tbody>
-          </table>
-        </div>
+        <div class="admin-records">{history_body}</div>
       </section>
       <section class="panel table-panel">
         <div class="table-head">

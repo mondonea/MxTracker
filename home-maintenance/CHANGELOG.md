@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.0.6
+
+- Consolidated maintenance admin repair into one compact Maintenance History Repair section.
+- Moved maintenance reopen controls into each item's latest history record instead of a separate maintenance table.
+- Reworked admin repair layout from a wide table to compact cards to reduce empty space and improve readability.
+
 ## 2.0.5
 
 - Changed normal Mark done actions to open a closure prompt for type and notes before recording maintenance history.

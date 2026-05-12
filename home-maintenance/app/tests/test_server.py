@@ -547,9 +547,10 @@ class MaintenanceServerTests(unittest.TestCase):
 
         locked_html = server.render_admin_view("csrf-token", admin_enabled=False)
         self.assertIn("Unlock admin mode", locked_html)
-        self.assertNotIn("Completion History Repair", locked_html)
+        self.assertNotIn("Maintenance History Repair", locked_html)
         unlocked_html = server.render_admin_view("csrf-token", admin_enabled=True)
-        self.assertIn("Completion History Repair", unlocked_html)
+        self.assertIn("Maintenance History Repair", unlocked_html)
+        self.assertIn('class="admin-record"', unlocked_html)
         self.assertIn("REMOVE Mx01-1", unlocked_html)
 
         removed = server.delete_completion_history_item(history_item["id"])
@@ -597,7 +598,9 @@ class MaintenanceServerTests(unittest.TestCase):
         html = server.render_admin_view("csrf-token", admin_enabled=True)
         self.assertIn("Save closure fields", html)
         self.assertIn("Could not reach filter safely.", html)
-        self.assertIn("Reopen Maintenance", html)
+        self.assertIn("Maintenance History Repair", html)
+        self.assertIn("Reopen maintenance", html)
+        self.assertNotIn("Completion History Repair", html)
 
     def test_admin_mode_reopens_maintenance_items_and_house_todos(self):
         today = date.today()
