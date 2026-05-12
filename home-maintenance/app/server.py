@@ -46,13 +46,22 @@ TODO_STATUS_LABELS = {
     "blocked": "Blocked",
     "done": "Done",
 }
+CLOSURE_TYPES = {"done", "skipped", "not_needed", "partial"}
+CLOSURE_LABELS = {
+    "done": "Done",
+    "skipped": "Skipped",
+    "not_needed": "Not needed",
+    "partial": "Partial",
+}
 TODO_STATUS_ORDER = {"in_work": 0, "ready": 1, "blocked": 2, "planning": 3, "backlog": 4, "done": 5}
 STATUS_ORDER = {"overdue": 0, "due_today": 1, "upcoming": 2}
 CSRF_COOKIE = "hm_csrf"
 THEME_COOKIE = "hm_theme"
+ADMIN_COOKIE = "hm_admin"
 THEMES = {"system", "light", "dark"}
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.4"
 MAX_FORM_BYTES = 16 * 1024
+ADMIN_SESSION_SECONDS = 15 * 60
 CSRF_TOKEN_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
 HA_AREA_ID_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
 ALLOWED_CLIENTS = {
@@ -90,6 +99,8 @@ HOMEASSISTANT_ENTITY_PREFIX = "mxtracker"
 HOMEASSISTANT_DASHBOARD_WINDOW_DAYS = 14
 API_ACTION_TOKEN = os.environ.get("HOME_MAINTENANCE_API_ACTION_TOKEN", "").strip()
 HA_PUBLISHER = None
+ADMIN_SESSIONS = {}
+ADMIN_SESSIONS_LOCK = threading.Lock()
 HOMEASSISTANT_AREAS_TEMPLATE = """
 {% set ns = namespace(items=[]) %}
 {% for area_id in areas() %}
@@ -276,11 +287,21 @@ def init_db():
                 task_name TEXT NOT NULL,
                 completed_on TEXT NOT NULL,
                 next_due_on TEXT NOT NULL,
+                previous_next_due_on TEXT NOT NULL DEFAULT '',
+                closure_type TEXT NOT NULL DEFAULT 'done',
+                closure_notes TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
             )
             """
         )
+        history_columns = {row["name"] for row in conn.execute("PRAGMA table_info(completion_history)").fetchall()}
+        if "previous_next_due_on" not in history_columns:
+            conn.execute("ALTER TABLE completion_history ADD COLUMN previous_next_due_on TEXT NOT NULL DEFAULT ''")
+        if "closure_type" not in history_columns:
+            conn.execute("ALTER TABLE completion_history ADD COLUMN closure_type TEXT NOT NULL DEFAULT 'done'")
+        if "closure_notes" not in history_columns:
+            conn.execute("ALTER TABLE completion_history ADD COLUMN closure_notes TEXT NOT NULL DEFAULT ''")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_next_due_on ON tasks(next_due_on, name)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_category ON tasks(category)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_ha_area ON tasks(ha_area_id, next_due_on)")
@@ -376,6 +397,30 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_todo_checklist_project ON todo_checklist_items(project_id, parent_id, position, id)")
 
 
+def display_sequence(prefix, value):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = 0
+    return f"{prefix}{number:02d}"
+
+
+def maintenance_public_id(task_id):
+    return display_sequence("Mx", task_id)
+
+
+def maintenance_iteration_id(task_id, iteration_number):
+    return f"{maintenance_public_id(task_id)}-{int(iteration_number)}"
+
+
+def todo_public_id(project_id):
+    return display_sequence("ToDo-", project_id)
+
+
+def id_badge(value):
+    return f'<span class="id-badge">{escape(value)}</span>'
+
+
 def get_tasks():
     with connect_db() as conn:
         rows = conn.execute("SELECT * FROM tasks ORDER BY next_due_on ASC, name ASC").fetchall()
@@ -393,6 +438,7 @@ def get_task(task_id):
 
 
 def enrich_task(task):
+    task["public_id"] = maintenance_public_id(task["id"])
     task["category"] = task.get("category") or "General"
     task["ha_area_id"] = task.get("ha_area_id") or ""
     task["ha_area_name"] = task.get("ha_area_name") or ""
@@ -430,45 +476,69 @@ def get_enriched_task(task_id):
     return enrich_task(task) if task else None
 
 
-def get_history(limit=20):
+def completion_history_rows(task_id=None, limit=None):
+    where_sql = "WHERE h.task_id = ?" if task_id is not None else ""
+    query_params = (task_id,) if task_id is not None else ()
+    sql = f"""
+        SELECT id, task_id, task_name, completed_on, next_due_on, previous_next_due_on, closure_type, closure_notes, created_at, iteration_number
+        FROM (
+            SELECT
+                h.id,
+                h.task_id,
+                h.task_name,
+                h.completed_on,
+                h.next_due_on,
+                h.previous_next_due_on,
+                h.closure_type,
+                h.closure_notes,
+                h.created_at,
+                ROW_NUMBER() OVER (
+                    PARTITION BY h.task_id
+                    ORDER BY h.completed_on ASC, h.id ASC
+                ) AS iteration_number
+            FROM completion_history h
+            {where_sql}
+        )
+        ORDER BY completed_on DESC, id DESC
+    """
+    if limit is not None:
+        sql += " LIMIT ?"
+        query_params = (*query_params, limit)
     with connect_db() as conn:
-        rows = conn.execute(
-            """
-            SELECT task_name, completed_on, next_due_on
-            FROM completion_history
-            ORDER BY completed_on DESC, id DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-    return [dict(row) for row in rows]
+        rows = conn.execute(sql, query_params).fetchall()
+    return [enrich_history_row(row) for row in rows]
+
+
+def get_history(limit=20):
+    return completion_history_rows(limit=limit)
 
 
 def get_task_history(task_id, limit=50):
-    with connect_db() as conn:
-        rows = conn.execute(
-            """
-            SELECT task_name, completed_on, next_due_on, created_at
-            FROM completion_history
-            WHERE task_id = ?
-            ORDER BY completed_on DESC, id DESC
-            LIMIT ?
-            """,
-            (task_id, limit),
-        ).fetchall()
-    return [dict(row) for row in rows]
+    return completion_history_rows(task_id=task_id, limit=limit)
 
 
 def get_all_history():
-    with connect_db() as conn:
-        rows = conn.execute(
-            """
-            SELECT task_name, completed_on, next_due_on, created_at
-            FROM completion_history
-            ORDER BY completed_on DESC, id DESC
-            """
-        ).fetchall()
-    return [dict(row) for row in rows]
+    return completion_history_rows()
+
+
+def get_completion_history_item(history_id):
+    if not history_id:
+        return None
+    for item in completion_history_rows():
+        if item["id"] == history_id:
+            return item
+    return None
+
+
+def enrich_history_row(row):
+    item = dict(row)
+    item["task_public_id"] = maintenance_public_id(item["task_id"])
+    item["iteration_number"] = int(item.get("iteration_number") or 0)
+    item["public_id"] = maintenance_iteration_id(item["task_id"], item["iteration_number"])
+    item["closure_type"] = item.get("closure_type") if item.get("closure_type") in CLOSURE_TYPES else "done"
+    item["closure_label"] = CLOSURE_LABELS[item["closure_type"]]
+    item["closure_notes"] = item.get("closure_notes") or ""
+    return item
 
 
 def get_task_checklist(task_id):
@@ -604,6 +674,7 @@ def event_type_label(event_type):
         "created": "Created",
         "updated": "Updated",
         "completed": "Completed",
+        "completion_removed": "Completion removed",
         "snoozed": "Snoozed",
         "deleted": "Deleted",
         "checklist_added": "Checklist step added",
@@ -622,7 +693,7 @@ def summarize_event_data(raw_data):
     details = []
     if "changed" in data and isinstance(data["changed"], list) and data["changed"]:
         details.append("changed=" + ",".join(str(item) for item in data["changed"][:12]))
-    for key in ["completed_on", "next_due_on", "from", "to", "days", "label", "is_done", "name"]:
+    for key in ["completion_id", "closure_type", "closure_notes", "completed_on", "next_due_on", "previous_next_due_on", "from", "to", "days", "label", "is_done", "name"]:
         if key in data and data[key] not in ("", None, []):
             details.append(f"{key}={data[key]}")
     return "; ".join(details)
@@ -716,6 +787,7 @@ def get_todo_checklist(project_id):
 
 
 def enrich_todo(todo, checklist=None):
+    todo["public_id"] = todo_public_id(todo["id"])
     todo["category"] = todo.get("category") or "General"
     todo["ha_area_id"] = todo.get("ha_area_id") or ""
     todo["ha_area_name"] = todo.get("ha_area_name") or ""
@@ -1046,7 +1118,7 @@ def get_completion_count(days=30):
     since = (date.today() - timedelta(days=days)).isoformat()
     with connect_db() as conn:
         row = conn.execute(
-            "SELECT COUNT(*) AS count FROM completion_history WHERE completed_on >= ?",
+            "SELECT COUNT(*) AS count FROM completion_history WHERE completed_on >= ? AND closure_type = 'done'",
             (since,),
         ).fetchone()
     return int(row["count"])
@@ -1259,6 +1331,7 @@ def task_matches_filters(task, filters):
         searchable = " ".join(
             [
                 task["name"],
+                task["public_id"],
                 task["notes"],
                 task["category"],
                 task.get("ha_area_name", ""),
@@ -1330,6 +1403,7 @@ def todo_matches_filters(todo, filters):
         searchable = " ".join(
             [
                 todo["title"],
+                todo["public_id"],
                 todo["description"],
                 todo["category"],
                 todo.get("ha_area_name", ""),
@@ -1400,6 +1474,7 @@ def homeassistant_task_row(task, base_path=""):
     detail_path = homeassistant_detail_path(task["id"])
     return {
         "id": task["id"],
+        "public_id": task["public_id"],
         "name": task["name"],
         "category": task["category"],
         "ha_area_id": task.get("ha_area_id", ""),
@@ -1428,6 +1503,7 @@ def homeassistant_todo_row(todo, base_path=""):
     detail_path = f"/todo/{todo['id']}"
     return {
         "id": todo["id"],
+        "public_id": todo["public_id"],
         "title": todo["title"],
         "category": todo["category"],
         "ha_area_id": todo.get("ha_area_id", ""),
@@ -1463,8 +1539,8 @@ def homeassistant_due_table(items):
     if not items:
         return "Nothing is due in the next 14 days."
     lines = [
-        "| Task | Status | Due date | Category | Area | Last done | Repeat |",
-        "|---|---|---|---|---|---|---|",
+        "| ID | Task | Status | Due date | Category | Area | Last done | Repeat |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     for item in items:
         due = item["due_phrase"]
@@ -1473,7 +1549,8 @@ def homeassistant_due_table(items):
         lines.append(
             " | ".join(
                 [
-                    f"| {markdown_table_link(item['name'], item['detail_url'])}",
+                    f"| {escape(item['public_id'])}",
+                    markdown_table_link(item["name"], item["detail_url"]),
                     due,
                     escape(item["due_date"]),
                     escape(item["category"]),
@@ -1490,14 +1567,15 @@ def homeassistant_todo_table(items):
     if not items:
         return "No house todos yet."
     lines = [
-        "| Todo | Status | Score | Progress | Area | Lane |",
-        "|---|---|---|---|---|---|",
+        "| ID | Todo | Status | Score | Progress | Area | Lane |",
+        "|---|---|---|---|---|---|---|",
     ]
     for item in items:
         lines.append(
             " | ".join(
                 [
-                    f"| {markdown_table_link(item['title'], item['detail_url'])}",
+                    f"| {escape(item['public_id'])}",
+                    markdown_table_link(item["title"], item["detail_url"]),
                     escape(item["status"]),
                     escape(item["priority_score"]),
                     f"{escape(item['progress_percent'])}%",
@@ -1660,6 +1738,7 @@ def public_task(task):
         return None
     return {
         "id": task["id"],
+        "public_id": task["public_id"],
         "name": task["name"],
         "category": task["category"],
         "ha_area_id": task.get("ha_area_id", ""),
@@ -1696,6 +1775,7 @@ def public_todo(todo):
         return None
     return {
         "id": todo["id"],
+        "public_id": todo["public_id"],
         "title": todo["title"],
         "category": todo["category"],
         "ha_area_id": todo.get("ha_area_id", ""),
@@ -1726,7 +1806,7 @@ def csv_cell(value):
 
 
 def safe_return_path(value):
-    if value in {"/", "/items", "/focus", "/calendar", "/reports", "/ha-setup", "/todos", "/todo/new"}:
+    if value in {"/", "/items", "/focus", "/calendar", "/reports", "/ha-setup", "/admin", "/todos", "/todo/new"}:
         return value
     if value.startswith("/item/") and value.removeprefix("/item/").isdigit():
         return value
@@ -1771,7 +1851,7 @@ def safe_referer_path(value, base_path=""):
     base_path = normalize_base_path(base_path)
     if base_path and path.startswith(base_path):
         path = path.removeprefix(base_path) or "/"
-    if path not in {"/", "/items", "/new", "/focus", "/calendar", "/reports", "/ha-setup", "/todos", "/todo/new"} and not path.startswith(("/edit/", "/item/", "/todo/", "/todo/edit/")):
+    if path not in {"/", "/items", "/new", "/focus", "/calendar", "/reports", "/ha-setup", "/admin", "/todos", "/todo/new"} and not path.startswith(("/edit/", "/item/", "/todo/", "/todo/edit/")):
         return "/"
     return path
 
@@ -1781,6 +1861,7 @@ def tasks_csv():
     writer = csv.writer(output)
     writer.writerow(
         [
+            "Maintenance ID",
             "Name",
             "Category",
             "Status",
@@ -1808,6 +1889,7 @@ def tasks_csv():
     for task in get_tasks():
         writer.writerow(
             [
+                csv_cell(task["public_id"]),
                 csv_cell(task["name"]),
                 csv_cell(task["category"]),
                 csv_cell(task["status_label"]),
@@ -1838,11 +1920,15 @@ def tasks_csv():
 def history_csv():
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["Task", "Completed on", "Next due after completion", "Recorded at"])
+    writer.writerow(["Iteration ID", "Maintenance ID", "Task", "Closure type", "Closure notes", "Closed on", "Next due after closure", "Recorded at"])
     for item in get_all_history():
         writer.writerow(
             [
+                csv_cell(item["public_id"]),
+                csv_cell(item["task_public_id"]),
                 csv_cell(item["task_name"]),
+                csv_cell(item["closure_label"]),
+                csv_cell(item["closure_notes"]),
                 csv_cell(item["completed_on"]),
                 csv_cell(item["next_due_on"]),
                 csv_cell(item["created_at"]),
@@ -1854,10 +1940,11 @@ def history_csv():
 def events_csv():
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["Task ID", "Task", "Event", "Details", "Recorded at"])
+    writer.writerow(["Maintenance ID", "Task ID", "Task", "Event", "Details", "Recorded at"])
     for item in get_all_task_events():
         writer.writerow(
             [
+                csv_cell(maintenance_public_id(item["task_id"])),
                 csv_cell(item["task_id"]),
                 csv_cell(item["task_name"]),
                 csv_cell(event_type_label(item["event_type"])),
@@ -2038,9 +2125,9 @@ def annual_report(year=None):
     with connect_db() as conn:
         rows = conn.execute(
             """
-            SELECT task_id, task_name, completed_on, next_due_on, created_at
+            SELECT task_id, task_name, completed_on, next_due_on, closure_type, closure_notes, created_at
             FROM completion_history
-            WHERE completed_on BETWEEN ? AND ?
+            WHERE completed_on BETWEEN ? AND ? AND closure_type = 'done'
             ORDER BY completed_on DESC, id DESC
             """,
             (start, end),
@@ -2083,7 +2170,7 @@ def handle_api_action(action, payload, base_path=""):
     if not task:
         return HTTPStatus.NOT_FOUND, {"ok": False, "error": "Maintenance item not found."}
     if action == "mark_done":
-        complete_task(task_id)
+        complete_task(task_id, "done", clean_closure_notes(payload.get("closure_notes", "")))
         updated = get_enriched_task(task_id)
         return HTTPStatus.OK, {"ok": True, "action": action, "task": public_task(updated)}
     if action == "snooze":
@@ -2397,16 +2484,26 @@ def save_task(fields, task_id=None):
     return task_id
 
 
-def complete_task(task_id):
+def latest_done_date(history_rows):
+    for item in history_rows:
+        if item["closure_type"] == "done":
+            return item["completed_on"]
+    return None
+
+
+def complete_task(task_id, closure_type="done", closure_notes=""):
     task = get_task(task_id)
     if not task:
         return False
+    closure_type = clean_closure_type(closure_type)
+    closure_notes = clean_closure_notes(closure_notes)
     completed_on = today_iso()
     next_due = calculate_next_due(
         parse_date(completed_on),
         task["interval_count"],
         task["interval_unit"],
     ).isoformat()
+    last_completed_on = completed_on if closure_type == "done" else task["last_completed_on"]
     now = utc_now_iso()
     with connect_db() as conn:
         conn.execute(
@@ -2415,22 +2512,34 @@ def complete_task(task_id):
             SET last_completed_on = ?, next_due_on = ?, updated_at = ?
             WHERE id = ?
             """,
-            (completed_on, next_due, now, task_id),
+            (last_completed_on, next_due, now, task_id),
         )
         conn.execute(
             """
             INSERT INTO completion_history
-                (task_id, task_name, completed_on, next_due_on, created_at)
-            VALUES (?, ?, ?, ?, ?)
+                (task_id, task_name, completed_on, next_due_on, previous_next_due_on, closure_type, closure_notes, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (task_id, task["name"], completed_on, next_due, now),
+            (task_id, task["name"], completed_on, next_due, task["next_due_on"], closure_type, closure_notes, now),
         )
-        conn.execute(
-            "UPDATE task_checklist_items SET is_done = 0, updated_at = ? WHERE task_id = ?",
-            (now, task_id),
-        )
+        if closure_type == "done":
+            conn.execute(
+                "UPDATE task_checklist_items SET is_done = 0, updated_at = ? WHERE task_id = ?",
+                (now, task_id),
+            )
     request_homeassistant_sync()
-    record_task_event(task_id, task["name"], "completed", {"completed_on": completed_on, "next_due_on": next_due})
+    record_task_event(
+        task_id,
+        task["name"],
+        "completed",
+        {
+            "closure_type": closure_type,
+            "closure_notes": closure_notes,
+            "completed_on": completed_on,
+            "next_due_on": next_due,
+            "previous_next_due_on": task["next_due_on"],
+        },
+    )
     return True
 
 
@@ -2459,6 +2568,125 @@ def delete_task(task_id):
         record_task_event(task_id, task["name"], "deleted", {"name": task["name"]})
 
 
+def delete_completion_history_item(history_id):
+    item = get_completion_history_item(history_id)
+    if not item:
+        return None
+    task = get_task(item["task_id"])
+    if not task:
+        return None
+    with connect_db() as conn:
+        conn.execute("DELETE FROM completion_history WHERE id = ?", (history_id,))
+    recalculate_task_from_history(item["task_id"], item.get("previous_next_due_on") or today_iso())
+    request_homeassistant_sync()
+    record_task_event(
+        item["task_id"],
+        task["name"],
+        "completion_removed",
+        {
+            "completion_id": item["public_id"],
+            "completed_on": item["completed_on"],
+            "next_due_on": get_task(item["task_id"])["next_due_on"],
+        },
+    )
+    return item
+
+
+def recalculate_task_from_history(task_id, fallback_next_due=None):
+    task = get_task(task_id)
+    if not task:
+        return False
+    history = completion_history_rows(task_id=task_id)
+    if history:
+        last_completed = latest_done_date(history)
+        next_due = history[0]["next_due_on"]
+    else:
+        last_completed = None
+        next_due = fallback_next_due or task["next_due_on"] or today_iso()
+    with connect_db() as conn:
+        conn.execute(
+            """
+            UPDATE tasks
+            SET last_completed_on = ?, next_due_on = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (last_completed, next_due, utc_now_iso(), task_id),
+        )
+    return True
+
+
+def update_completion_history_item(history_id, fields):
+    item = get_completion_history_item(history_id)
+    if not item:
+        return ["Completion record not found."], None
+    completed_on = fields.get("completed_on", "").strip()
+    next_due_on = fields.get("next_due_on", "").strip()
+    errors = []
+    for label, value in (("Closed date", completed_on), ("Next due date", next_due_on)):
+        try:
+            parse_date(value)
+        except ValueError:
+            errors.append(f"{label} must be valid.")
+    cleaned = {
+        "completed_on": completed_on,
+        "next_due_on": next_due_on,
+        "closure_type": clean_closure_type(fields.get("closure_type", "done")),
+        "closure_notes": clean_closure_notes(fields.get("closure_notes", "")),
+    }
+    if errors:
+        return errors, None
+    with connect_db() as conn:
+        conn.execute(
+            """
+            UPDATE completion_history
+            SET completed_on = ?, next_due_on = ?, closure_type = ?, closure_notes = ?
+            WHERE id = ?
+            """,
+            (cleaned["completed_on"], cleaned["next_due_on"], cleaned["closure_type"], cleaned["closure_notes"], history_id),
+        )
+    recalculate_task_from_history(item["task_id"], item.get("previous_next_due_on") or today_iso())
+    request_homeassistant_sync()
+    record_task_event(
+        item["task_id"],
+        item["task_name"],
+        "completion_edited",
+        {
+            "completion_id": item["public_id"],
+            "completed_on": cleaned["completed_on"],
+            "next_due_on": cleaned["next_due_on"],
+            "closure_type": cleaned["closure_type"],
+            "closure_notes": cleaned["closure_notes"],
+        },
+    )
+    return [], get_completion_history_item(history_id)
+
+
+def reopen_task(task_id):
+    task = get_task(task_id)
+    if not task:
+        return None
+    now = utc_now_iso()
+    due_on = today_iso()
+    with connect_db() as conn:
+        conn.execute("UPDATE tasks SET next_due_on = ?, updated_at = ? WHERE id = ?", (due_on, now, task_id))
+        conn.execute("UPDATE task_checklist_items SET is_done = 0, updated_at = ? WHERE task_id = ?", (now, task_id))
+    request_homeassistant_sync()
+    record_task_event(task_id, task["name"], "reopened", {"previous_next_due_on": task["next_due_on"], "next_due_on": due_on})
+    return get_task(task_id)
+
+
+def reopen_todo(project_id):
+    todo = get_todo(project_id)
+    if not todo:
+        return None
+    now = utc_now_iso()
+    with connect_db() as conn:
+        conn.execute("UPDATE todo_projects SET status = 'backlog', updated_at = ? WHERE id = ?", (now, project_id))
+        conn.execute("UPDATE todo_checklist_items SET is_done = 0, updated_at = ? WHERE project_id = ?", (now, project_id))
+    request_homeassistant_sync()
+    return get_enriched_todo(project_id)
+
+
 def trash_icon():
     return """
       <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
@@ -2469,6 +2697,56 @@ def trash_icon():
 
 def delete_confirmed(fields):
     return fields.get("confirm_text", "").strip() == "DELETE"
+
+
+def admin_unlock_confirmed(fields):
+    return fields.get("confirm_text", "").strip() == "ADMIN"
+
+
+def history_delete_confirmed(fields, history_item):
+    return history_item and fields.get("confirm_text", "").strip() == f"REMOVE {history_item['public_id']}"
+
+
+def task_reopen_confirmed(fields, task):
+    return task and fields.get("confirm_text", "").strip() == f"REOPEN {maintenance_public_id(task['id'])}"
+
+
+def todo_reopen_confirmed(fields, todo):
+    return todo and fields.get("confirm_text", "").strip() == f"REOPEN {todo_public_id(todo['id'])}"
+
+
+def clean_closure_type(value):
+    value = (value or "done").strip()
+    return value if value in CLOSURE_TYPES else "done"
+
+
+def clean_closure_notes(value):
+    return (value or "").strip()[:1000]
+
+
+def create_admin_session():
+    token = secrets.token_urlsafe(32)
+    expires_at = int(time.time()) + ADMIN_SESSION_SECONDS
+    with ADMIN_SESSIONS_LOCK:
+        ADMIN_SESSIONS[token] = expires_at
+    return token, expires_at
+
+
+def admin_session_active(token):
+    if not token or not valid_csrf_token_value(token):
+        return False
+    now = int(time.time())
+    with ADMIN_SESSIONS_LOCK:
+        expired = [key for key, expires_at in ADMIN_SESSIONS.items() if expires_at <= now]
+        for key in expired:
+            ADMIN_SESSIONS.pop(key, None)
+        return ADMIN_SESSIONS.get(token, 0) > now
+
+
+def clear_admin_session(token):
+    if token:
+        with ADMIN_SESSIONS_LOCK:
+            ADMIN_SESSIONS.pop(token, None)
 
 
 def render_layout(title, body, csrf_token, notice="", theme="system", base_path="", active_view=""):
@@ -2491,7 +2769,7 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
             ],
         ),
         ("Projects", [("todos", "House todos", "/todos")]),
-        ("System", [("ha_setup", "HA setup", "/ha-setup")]),
+        ("System", [("ha_setup", "HA setup", "/ha-setup"), ("admin", "Admin", "/admin")]),
     ]
     nav_groups_html = []
     for group_label, items in nav_groups:
@@ -2749,6 +3027,21 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
     .badge.overdue {{ color: var(--danger); }}
     .badge.due_today {{ color: var(--warn); }}
     .badge.upcoming {{ color: var(--ok); }}
+    .id-badge {{
+      display: inline-flex;
+      align-items: center;
+      width: fit-content;
+      min-height: 24px;
+      padding: 2px 7px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--surface-strong);
+      color: var(--muted);
+      font-size: .76rem;
+      font-weight: 900;
+      letter-spacing: .03em;
+      white-space: nowrap;
+    }}
     .notes {{
       white-space: pre-wrap;
       overflow-wrap: anywhere;
@@ -3028,10 +3321,12 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
       font-weight: 800;
     }}
     .task-table .col-name {{ width: 32%; }}
+    .task-table .col-id {{ width: 72px; }}
     .task-table .col-category {{ width: 13%; }}
     .task-table .col-due {{ width: 19%; }}
     .task-table .col-repeat {{ width: 16%; }}
     .task-table .col-actions {{ width: 20%; }}
+    .audit-table .col-id {{ width: 88px; }}
     .audit-table .col-name {{ width: 230px; }}
     .audit-table .col-category {{ width: 120px; }}
     .audit-table .col-area {{ width: 130px; }}
@@ -3236,6 +3531,7 @@ def render_layout(title, body, csrf_token, notice="", theme="system", base_path=
       .task-table, .task-table tbody, .task-table tr, .task-table td {{ display: block; width: 100%; max-width: 100%; }}
       .task-table thead {{ display: none; }}
       .task-table .col-name,
+      .task-table .col-id,
       .task-table .col-category,
       .task-table .col-due,
       .task-table .col-repeat,
@@ -3405,6 +3701,7 @@ def render_dashboard(csrf_token, notice="", theme="system", base_path=""):
                 f"""
                 <tr>
                   <td data-label="Task" class="col-name">
+                    {id_badge(task["public_id"])}
                     <strong><a href="{app_url(f"/item/{task_id}", base_path)}">{escape(task["name"])}</a></strong>
                     {notes}
                     <div class="meta">Last done {last_done}</div>
@@ -3459,6 +3756,7 @@ def render_dashboard(csrf_token, notice="", theme="system", base_path=""):
         history_items.append(
             f"""
             <div class="history-item">
+              {id_badge(item["public_id"])}
               <strong>{escape(item["task_name"])}</strong>
               <div>Completed {escape(item["completed_on"])} - Next due {escape(item["next_due_on"])}</div>
             </div>
@@ -3522,6 +3820,7 @@ def render_focus_view(csrf_token, notice="", theme="system", base_path=""):
                 f"""
                 <a class="focus-item{status_class}" href="{app_url(f"/item/{task["id"]}", base_path)}">
                   <div>
+                    {id_badge(task["public_id"])}
                     <strong>{escape(task["name"])}</strong>
                     <div class="focus-meta">
                       <span class="badge {task["status"]}">{escape(task["due_phrase"])}</span>
@@ -3571,6 +3870,7 @@ def render_todos_view(csrf_token, query=None, notice="", theme="system", base_pa
             f"""
             <a class="todo-card {todo["risk_band"]}" href="{app_url(f"/todo/{todo["id"]}", base_path)}">
               <div>
+                {id_badge(todo["public_id"])}
                 <strong class="todo-title">{escape(todo["title"])}</strong>
                 <div class="focus-meta">
                   <span class="badge {todo["derived_status"]}">{escape(todo["status_label"])}</span>
@@ -3630,7 +3930,7 @@ def render_todos_view(csrf_token, query=None, notice="", theme="system", base_pa
             dots = []
             for todo in sorted(todos_by_cell.get((likelihood, consequence), []), key=lambda item: -item["priority_score"]):
                 dots.append(
-                    f'<a class="matrix-dot cost-{todo["cost"]}" href="{app_url(f"/todo/{todo["id"]}", base_path)}" title="{escape(todo["title"])}">{escape(todo["id"])}</a>'
+                    f'<a class="matrix-dot cost-{todo["cost"]}" href="{app_url(f"/todo/{todo["id"]}", base_path)}" title="{escape(todo["public_id"])} {escape(todo["title"])}">{escape(todo["id"])}</a>'
                 )
             matrix_cells.append(f'<div class="matrix-cell {band}">{"".join(dots)}</div>')
 
@@ -3655,7 +3955,7 @@ def render_todos_view(csrf_token, query=None, notice="", theme="system", base_pa
           <div class="filter-grid">
             <div>
               <label for="todo-q">Search</label>
-              <input id="todo-q" name="q" value="{escape(filters["q"])}" placeholder="Title, detail, area, lane">
+              <input id="todo-q" name="q" value="{escape(filters["q"])}" placeholder="ID, title, detail, area, lane">
             </div>
             <div>
               <label for="todo-category">Category</label>
@@ -3737,6 +4037,7 @@ def render_calendar_view(csrf_token, query=None, notice="", theme="system", base
                 task_links.append(
                     f"""
                     <a class="calendar-task {task["status"]}" href="{app_url(f"/item/{task["id"]}", base_path)}">
+                      {id_badge(task["public_id"])}
                       <strong>{escape(task["name"])}</strong>
                       <div class="meta">{escape(task["category"])} - {escape(task["due_phrase"])}</div>
                       {area}
@@ -3888,6 +4189,197 @@ def render_ha_setup_view(csrf_token, notice="", theme="system", base_path=""):
     return render_layout("Home Assistant Setup", body, csrf_token, notice, theme, base_path, active_view="ha_setup")
 
 
+def render_admin_view(csrf_token, admin_enabled=False, notice="", theme="system", base_path=""):
+    if not admin_enabled:
+        body = f"""
+          <section class="panel">
+            <h2>Admin Mode</h2>
+            <p class="meta">Admin mode is for repair actions only. Unlock it only when you need to correct bad audit data.</p>
+            <form action="{app_url("/admin/unlock", base_path)}" method="post">
+              <input type="hidden" name="csrf_token" value="{csrf_token}">
+              <label for="confirm_text">Type ADMIN to unlock for 15 minutes</label>
+              <input id="confirm_text" name="confirm_text" autocomplete="off" required pattern="ADMIN" placeholder="ADMIN">
+              <div class="actions form-actions">
+                <button type="submit">Unlock admin mode</button>
+              </div>
+            </form>
+          </section>
+        """
+        return render_layout("Admin Mode", body, csrf_token, notice, theme, base_path, active_view="admin")
+
+    rows = []
+    for item in get_all_history()[:100]:
+        confirm_phrase = f"REMOVE {item['public_id']}"
+        closure_options = "".join(
+            f'<option value="{key}"{" selected" if key == item["closure_type"] else ""}>{escape(label)}</option>'
+            for key, label in CLOSURE_LABELS.items()
+        )
+        rows.append(
+            f"""
+            <tr>
+              <td data-label="ID" class="col-id">{id_badge(item["public_id"])}</td>
+              <td data-label="Task" class="col-name">
+                <strong>{escape(item["task_name"])}</strong>
+                <div class="meta">{escape(item["task_public_id"])}</div>
+              </td>
+              <td data-label="Type" class="col-category">{escape(item["closure_label"])}</td>
+              <td data-label="Closed" class="col-date">{escape(item["completed_on"])}</td>
+              <td data-label="Next due" class="col-date">{escape(item["next_due_on"])}</td>
+              <td data-label="Notes" class="col-name">{escape(item["closure_notes"])}</td>
+              <td data-label="Actions" class="col-actions">
+                <form action="{app_url(f"/admin/history/edit/{item["id"]}", base_path)}" method="post">
+                  <input type="hidden" name="csrf_token" value="{csrf_token}">
+                  <label for="completed-{item["id"]}">Closed date</label>
+                  <input id="completed-{item["id"]}" type="date" name="completed_on" value="{escape(item["completed_on"])}" required>
+                  <label for="next-due-{item["id"]}">Next due</label>
+                  <input id="next-due-{item["id"]}" type="date" name="next_due_on" value="{escape(item["next_due_on"])}" required>
+                  <label for="closure-type-{item["id"]}">Closure type</label>
+                  <select id="closure-type-{item["id"]}" name="closure_type">{closure_options}</select>
+                  <label for="closure-notes-{item["id"]}">Closure notes</label>
+                  <textarea id="closure-notes-{item["id"]}" name="closure_notes" maxlength="1000">{escape(item["closure_notes"])}</textarea>
+                  <button class="secondary" type="submit">Save closure fields</button>
+                </form>
+                <form action="{app_url(f"/admin/history/delete/{item["id"]}", base_path)}" method="post">
+                  <input type="hidden" name="csrf_token" value="{csrf_token}">
+                  <label for="confirm-{item["id"]}">Type {escape(confirm_phrase)}</label>
+                  <input id="confirm-{item["id"]}" name="confirm_text" autocomplete="off" required placeholder="{escape(confirm_phrase)}">
+                  <button class="danger confirm-danger" type="submit">{trash_icon()} Remove completion</button>
+                </form>
+              </td>
+            </tr>
+            """
+        )
+    table_body = "".join(rows) if rows else '<tr><td colspan="7" class="empty">No completion history to repair.</td></tr>'
+    maintenance_rows = []
+    for task in get_tasks():
+        confirm_phrase = f"REOPEN {task['public_id']}"
+        maintenance_rows.append(
+            f"""
+            <tr>
+              <td data-label="ID" class="col-id">{id_badge(task["public_id"])}</td>
+              <td data-label="Task" class="col-name">
+                <strong>{escape(task["name"])}</strong>
+                <div class="meta">{escape(task["category"])}</div>
+              </td>
+              <td data-label="Last done" class="col-date">{escape(task["last_completed_on"] or "Never")}</td>
+              <td data-label="Next due" class="col-date">{escape(task["next_due_on"])}</td>
+              <td data-label="Actions" class="col-actions">
+                <form action="{app_url(f"/admin/task/reopen/{task["id"]}", base_path)}" method="post">
+                  <input type="hidden" name="csrf_token" value="{csrf_token}">
+                  <label for="reopen-task-{task["id"]}">Type {escape(confirm_phrase)}</label>
+                  <input id="reopen-task-{task["id"]}" name="confirm_text" autocomplete="off" required placeholder="{escape(confirm_phrase)}">
+                  <button class="secondary" type="submit">Reopen maintenance item</button>
+                </form>
+              </td>
+            </tr>
+            """
+        )
+    maintenance_body = "".join(maintenance_rows) if maintenance_rows else '<tr><td colspan="5" class="empty">No maintenance items to reopen.</td></tr>'
+    todo_rows = []
+    for todo in get_todos():
+        confirm_phrase = f"REOPEN {todo['public_id']}"
+        todo_rows.append(
+            f"""
+            <tr>
+              <td data-label="ID" class="col-id">{id_badge(todo["public_id"])}</td>
+              <td data-label="Task" class="col-name">
+                <strong>{escape(todo["title"])}</strong>
+                <div class="meta">{escape(todo["category"])} - {escape(todo["status_label"])}</div>
+              </td>
+              <td data-label="Progress" class="col-date">{todo["progress_percent"]}%</td>
+              <td data-label="Target" class="col-date">{escape(todo["target_on"] or "No target")}</td>
+              <td data-label="Actions" class="col-actions">
+                <form action="{app_url(f"/admin/todo/reopen/{todo["id"]}", base_path)}" method="post">
+                  <input type="hidden" name="csrf_token" value="{csrf_token}">
+                  <label for="reopen-todo-{todo["id"]}">Type {escape(confirm_phrase)}</label>
+                  <input id="reopen-todo-{todo["id"]}" name="confirm_text" autocomplete="off" required placeholder="{escape(confirm_phrase)}">
+                  <button class="secondary" type="submit">Reopen house todo</button>
+                </form>
+              </td>
+            </tr>
+            """
+        )
+    todo_body = "".join(todo_rows) if todo_rows else '<tr><td colspan="5" class="empty">No house todos to reopen.</td></tr>'
+    body = f"""
+      <section class="panel">
+        <div class="table-head">
+          <div>
+            <h2>Admin Mode</h2>
+            <div class="meta">Repair audit data, edit closure records, and reopen items after accidental completion.</div>
+          </div>
+          <form class="inline" action="{app_url("/admin/lock", base_path)}" method="post">
+            <input type="hidden" name="csrf_token" value="{csrf_token}">
+            <button class="secondary" type="submit">Lock admin mode</button>
+          </form>
+        </div>
+        <p class="meta">Edits and removals recalculate maintenance last-done and next-due values from the remaining history. Reopen keeps audit history intact and makes the item active again.</p>
+      </section>
+      <section class="panel table-panel">
+        <div class="table-head">
+          <h2>Completion History Repair</h2>
+          <div class="meta">Newest records first</div>
+        </div>
+        <div class="table-scroll">
+          <table class="task-table audit-table">
+            <thead>
+              <tr>
+                <th class="col-id">ID</th>
+                <th class="col-name">Task</th>
+                <th class="col-category">Type</th>
+                <th class="col-date">Closed</th>
+                <th class="col-date">Next due</th>
+                <th class="col-name">Notes</th>
+                <th class="col-actions">Actions</th>
+              </tr>
+            </thead>
+            <tbody>{table_body}</tbody>
+          </table>
+        </div>
+      </section>
+      <section class="panel table-panel">
+        <div class="table-head">
+          <h2>Reopen Maintenance</h2>
+          <div class="meta">Keeps history, moves next due to today, and clears checklist steps.</div>
+        </div>
+        <div class="table-scroll">
+          <table class="task-table audit-table">
+            <thead>
+              <tr>
+                <th class="col-id">ID</th>
+                <th class="col-name">Item</th>
+                <th class="col-date">Last done</th>
+                <th class="col-date">Next due</th>
+                <th class="col-actions">Actions</th>
+              </tr>
+            </thead>
+            <tbody>{maintenance_body}</tbody>
+          </table>
+        </div>
+      </section>
+      <section class="panel table-panel">
+        <div class="table-head">
+          <h2>Reopen House Todos</h2>
+          <div class="meta">Moves the todo back to backlog and clears checklist progress.</div>
+        </div>
+        <div class="table-scroll">
+          <table class="task-table audit-table">
+            <thead>
+              <tr>
+                <th class="col-id">ID</th>
+                <th class="col-name">Todo</th>
+                <th class="col-date">Progress</th>
+                <th class="col-date">Target</th>
+                <th class="col-actions">Actions</th>
+              </tr>
+            </thead>
+            <tbody>{todo_body}</tbody>
+          </table>
+        </div>
+      </section>
+    """
+    return render_layout("Admin Mode", body, csrf_token, notice, theme, base_path, active_view="admin")
+
+
 def render_items_audit(csrf_token, query=None, notice="", theme="system", base_path=""):
     tasks = get_tasks()
     visible_tasks, filters = filter_tasks(tasks, query or {})
@@ -3904,6 +4396,7 @@ def render_items_audit(csrf_token, query=None, notice="", theme="system", base_p
             rows.append(
                 f"""
                 <tr>
+                  <td data-label="ID" class="col-id">{id_badge(task["public_id"])}</td>
                   <td data-label="Task" class="col-name">
                     <strong><a href="{app_url(f"/item/{task_id}", base_path)}">{escape(task["name"])}</a></strong>
                     {asset}
@@ -3934,7 +4427,7 @@ def render_items_audit(csrf_token, query=None, notice="", theme="system", base_p
             )
         table_body = "".join(rows)
     else:
-        table_body = '<tr><td colspan="8" class="empty">No maintenance items match these filters.</td></tr>'
+        table_body = '<tr><td colspan="9" class="empty">No maintenance items match these filters.</td></tr>'
 
     category_options = ['<option value="">All categories</option>']
     for category in CATEGORIES:
@@ -3968,7 +4461,7 @@ def render_items_audit(csrf_token, query=None, notice="", theme="system", base_p
           <div class="filter-grid">
             <div>
               <label for="task-q">Search</label>
-              <input id="task-q" name="q" value="{escape(filters["q"])}" placeholder="Task, notes, category, area">
+              <input id="task-q" name="q" value="{escape(filters["q"])}" placeholder="ID, task, notes, category, area">
             </div>
             <div>
               <label for="task-category">Category</label>
@@ -3999,6 +4492,7 @@ def render_items_audit(csrf_token, query=None, notice="", theme="system", base_p
         <table class="task-table audit-table">
           <thead>
             <tr>
+              <th class="col-id">ID</th>
               <th class="col-name">Task</th>
               <th class="col-category">Category</th>
               <th class="col-area">Area</th>
@@ -4049,6 +4543,7 @@ def render_item_detail(task, csrf_token, notice="", theme="system", base_path=""
             """
         )
     checklist_html = "".join(checklist_items) if checklist_items else '<div class="empty">No checklist steps yet.</div>'
+    closure_options = "".join(f'<option value="{key}">{escape(label)}</option>' for key, label in CLOSURE_LABELS.items())
 
     if history:
         history_rows = []
@@ -4056,22 +4551,25 @@ def render_item_detail(task, csrf_token, notice="", theme="system", base_path=""
             history_rows.append(
                 f"""
                 <tr>
-                  <td data-label="Completed">{escape(item["completed_on"])}</td>
+                  <td data-label="ID">{id_badge(item["public_id"])}</td>
+                  <td data-label="Type">{escape(item["closure_label"])}</td>
+                  <td data-label="Closed">{escape(item["completed_on"])}</td>
                   <td data-label="Next due">{escape(item["next_due_on"])}</td>
+                  <td data-label="Notes">{escape(item["closure_notes"] or "")}</td>
                   <td data-label="Recorded">{escape(item["created_at"])}</td>
                 </tr>
                 """
             )
         history_body = "".join(history_rows)
     else:
-        history_body = '<tr><td colspan="3" class="empty">No completions recorded yet.</td></tr>'
+        history_body = '<tr><td colspan="6" class="empty">No completions recorded yet.</td></tr>'
     event_items = []
     for event in events:
         data = event.get("event_data_json") or {}
         details = []
         if "changed" in data and data["changed"]:
             details.append("Changed " + ", ".join(str(item) for item in data["changed"][:8]))
-        for key in ["completed_on", "next_due_on", "from", "to", "days", "label"]:
+        for key in ["closure_type", "closure_notes", "completed_on", "next_due_on", "from", "to", "days", "label"]:
             if key in data and data[key] not in ("", None, []):
                 details.append(f"{key.replace('_', ' ')}: {data[key]}")
         event_items.append(
@@ -4092,11 +4590,12 @@ def render_item_detail(task, csrf_token, notice="", theme="system", base_path=""
         <div class="table-head">
           <div>
             <h2>{escape(task["name"])}</h2>
-            <div class="meta">{escape(task["category"])} - {escape(area_name)}</div>
+            <div class="meta">{escape(task["public_id"])} - {escape(task["category"])} - {escape(area_name)}</div>
           </div>
           <span class="badge {task["status"]}">{escape(task["due_phrase"])}</span>
         </div>
         <div class="detail-grid">
+          <div class="detail-field"><span>Maintenance ID</span>{escape(task["public_id"])}</div>
           <div class="detail-field"><span>Category</span>{escape(task["category"])}</div>
           <div class="detail-field"><span>Home Assistant area</span>{escape(area_name)}</div>
           <div class="detail-field"><span>Asset</span>{escape(task.get("asset_name") or "Not set")}</div>
@@ -4138,6 +4637,7 @@ def render_item_detail(task, csrf_token, notice="", theme="system", base_path=""
           <form class="inline" action="{complete_url}" method="post">
             <input type="hidden" name="csrf_token" value="{csrf_token}">
             <input type="hidden" name="return_to" value="{escape(return_to)}">
+            <input type="hidden" name="closure_type" value="done">
             <button type="submit">Mark done</button>
           </form>
           <form class="inline" action="{snooze_url}" method="post">
@@ -4148,6 +4648,25 @@ def render_item_detail(task, csrf_token, notice="", theme="system", base_path=""
           <a class="button secondary" href="{edit_url}">Edit</a>
           <a class="button danger" href="{delete_url}">Delete</a>
         </div>
+        <div class="detail-section">
+          <div class="table-head">
+            <div>
+              <h2>Record Closure</h2>
+              <div class="meta">Use this when you need notes or a closure type other than Done.</div>
+            </div>
+          </div>
+          <form action="{complete_url}" method="post">
+            <input type="hidden" name="csrf_token" value="{csrf_token}">
+            <input type="hidden" name="return_to" value="{escape(return_to)}">
+            <label for="closure_type">Closure type</label>
+            <select id="closure_type" name="closure_type">{closure_options}</select>
+            <label for="closure_notes">Closure notes</label>
+            <textarea id="closure_notes" name="closure_notes" maxlength="1000" placeholder="What happened, what was skipped, parts used, or why it was not needed"></textarea>
+            <div class="actions form-actions">
+              <button type="submit">Record closure</button>
+            </div>
+          </form>
+        </div>
       </section>
       <section class="panel table-panel">
         <div class="table-head">
@@ -4157,8 +4676,11 @@ def render_item_detail(task, csrf_token, notice="", theme="system", base_path=""
         <table class="task-table">
           <thead>
             <tr>
-              <th>Completed</th>
-              <th>Next due after completion</th>
+              <th>ID</th>
+              <th>Type</th>
+              <th>Closed</th>
+              <th>Next due after closure</th>
+              <th>Notes</th>
               <th>Recorded</th>
             </tr>
           </thead>
@@ -4235,11 +4757,12 @@ def render_todo_detail(todo, csrf_token, notice="", theme="system", base_path=""
         <div class="table-head">
           <div>
             <h2>{escape(todo["title"])}</h2>
-            <div class="meta">{escape(todo["category"])} - {escape(area_name)}</div>
+            <div class="meta">{escape(todo["public_id"])} - {escape(todo["category"])} - {escape(area_name)}</div>
           </div>
           <span class="score-pill">{escape(todo["priority_score"])}</span>
         </div>
         <div class="detail-grid">
+          <div class="detail-field"><span>Todo ID</span>{escape(todo["public_id"])}</div>
           <div class="detail-field"><span>Status</span>{escape(todo["status_label"])}</div>
           <div class="detail-field"><span>Progress</span>{todo["progress_percent"]}%</div>
           <div class="detail-field"><span>Ready gate</span>{todo["required_done"]}/{todo["required_total"]}</div>
@@ -4671,6 +5194,10 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
             notice = parse_qs(parsed.query).get("notice", [""])[0]
             self.respond_html(render_ha_setup_view(csrf, notice=notice, theme=theme, base_path=base_path), csrf)
             return
+        if parsed.path == "/admin":
+            notice = parse_qs(parsed.query).get("notice", [""])[0]
+            self.respond_html(render_admin_view(csrf, self.admin_mode_enabled(), notice=notice, theme=theme, base_path=base_path), csrf)
+            return
         if parsed.path == "/focus":
             notice = parse_qs(parsed.query).get("notice", [""])[0]
             self.respond_html(render_focus_view(csrf, notice=notice, theme=theme, base_path=base_path), csrf)
@@ -4868,6 +5395,76 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
                 delete_todo(project_id)
             self.redirect(return_to if return_to != f"/todo/{project_id}" else "/todos", "House todo deleted.")
             return
+        if parsed.path == "/admin/unlock":
+            if admin_unlock_confirmed(fields):
+                token, _ = create_admin_session()
+                self.redirect_with_admin_cookie("/admin", "Admin mode unlocked for 15 minutes.", token=token)
+            else:
+                self.redirect("/admin", "Type ADMIN to unlock admin mode.")
+            return
+        if parsed.path == "/admin/lock":
+            self.clear_current_admin_session()
+            self.redirect_with_admin_cookie("/admin", "Admin mode locked.", clear=True)
+            return
+        if parsed.path.startswith("/admin/history/delete/"):
+            history_id = self.extract_id(parsed.path, "/admin/history/delete/")
+            history_item = get_completion_history_item(history_id) if history_id else None
+            if not self.admin_mode_enabled():
+                self.redirect("/admin", "Unlock admin mode before repairing completion history.")
+                return
+            if not history_item:
+                self.redirect("/admin", "Completion record not found.")
+                return
+            if not history_delete_confirmed(fields, history_item):
+                self.redirect("/admin", f"Type REMOVE {history_item['public_id']} to remove that completion.")
+                return
+            removed = delete_completion_history_item(history_id)
+            if removed:
+                self.redirect("/admin", f"Removed completion {removed['public_id']}.")
+            else:
+                self.redirect("/admin", "Completion record could not be removed.")
+            return
+        if parsed.path.startswith("/admin/history/edit/"):
+            history_id = self.extract_id(parsed.path, "/admin/history/edit/")
+            if not self.admin_mode_enabled():
+                self.redirect("/admin", "Unlock admin mode before editing completion history.")
+                return
+            errors, updated = update_completion_history_item(history_id, fields) if history_id else (["Completion record not found."], None)
+            if errors:
+                self.redirect("/admin", " ".join(errors))
+            else:
+                self.redirect("/admin", f"Updated completion {updated['public_id']}.")
+            return
+        if parsed.path.startswith("/admin/task/reopen/"):
+            task_id = self.extract_id(parsed.path, "/admin/task/reopen/")
+            task = get_enriched_task(task_id) if task_id else None
+            if not self.admin_mode_enabled():
+                self.redirect("/admin", "Unlock admin mode before reopening maintenance items.")
+                return
+            if not task:
+                self.redirect("/admin", "Maintenance item not found.")
+                return
+            if not task_reopen_confirmed(fields, task):
+                self.redirect("/admin", f"Type REOPEN {task['public_id']} to reopen that maintenance item.")
+                return
+            reopened = reopen_task(task_id)
+            self.redirect("/admin", f"Reopened maintenance item {task['public_id']}.") if reopened else self.redirect("/admin", "Maintenance item could not be reopened.")
+            return
+        if parsed.path.startswith("/admin/todo/reopen/"):
+            project_id = self.extract_id(parsed.path, "/admin/todo/reopen/")
+            todo = get_enriched_todo(project_id) if project_id else None
+            if not self.admin_mode_enabled():
+                self.redirect("/admin", "Unlock admin mode before reopening house todos.")
+                return
+            if not todo:
+                self.redirect("/admin", "House todo not found.")
+                return
+            if not todo_reopen_confirmed(fields, todo):
+                self.redirect("/admin", f"Type REOPEN {todo['public_id']} to reopen that house todo.")
+                return
+            reopened = reopen_todo(project_id)
+            self.redirect("/admin", f"Reopened house todo {todo['public_id']}.") if reopened else self.redirect("/admin", "House todo could not be reopened.")
+            return
         if parsed.path.startswith("/edit/"):
             task_id = self.extract_id(parsed.path, "/edit/")
             if not task_id or not get_task(task_id):
@@ -4885,8 +5482,9 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/complete/"):
             task_id = self.extract_id(parsed.path, "/complete/")
             return_to = safe_return_path(fields.get("return_to", "/"))
-            if task_id and complete_task(task_id):
-                self.redirect(return_to, "Maintenance item completed.")
+            closure_type = clean_closure_type(fields.get("closure_type", "done"))
+            if task_id and complete_task(task_id, closure_type, fields.get("closure_notes", "")):
+                self.redirect(return_to, f"Maintenance item closed as {CLOSURE_LABELS[closure_type].lower()}.")
             else:
                 self.redirect(return_to, "Item not found.")
             return
@@ -4989,6 +5587,17 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
         morsel = cookie.get(THEME_COOKIE)
         return safe_theme(morsel.value if morsel else "system")
 
+    def current_admin_token(self):
+        cookie = SimpleCookie(self.headers.get("Cookie"))
+        morsel = cookie.get(ADMIN_COOKIE)
+        return morsel.value if morsel else ""
+
+    def admin_mode_enabled(self):
+        return admin_session_active(self.current_admin_token())
+
+    def clear_current_admin_session(self):
+        clear_admin_session(self.current_admin_token())
+
     def set_security_headers(self):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "same-origin")
@@ -5003,6 +5612,12 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
 
     def set_theme_cookie(self, theme):
         self.send_header("Set-Cookie", f"{THEME_COOKIE}={safe_theme(theme)}; HttpOnly; SameSite=Lax; Path={self.base_path() or '/'}")
+
+    def set_admin_cookie(self, token):
+        self.send_header("Set-Cookie", f"{ADMIN_COOKIE}={token}; HttpOnly; SameSite=Lax; Path={self.base_path() or '/'}; Max-Age={ADMIN_SESSION_SECONDS}")
+
+    def clear_admin_cookie(self):
+        self.send_header("Set-Cookie", f"{ADMIN_COOKIE}=; HttpOnly; SameSite=Lax; Path={self.base_path() or '/'}; Max-Age=0")
 
     def respond_html(self, content, csrf_token, status=HTTPStatus.OK):
         body = content.encode("utf-8")
@@ -5057,6 +5672,20 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
         self.send_header("Location", app_url(path, self.base_path()))
         self.set_security_headers()
         self.set_theme_cookie(theme)
+        self.end_headers()
+
+    def redirect_with_admin_cookie(self, path, notice="", token="", clear=False):
+        location = app_url(path, self.base_path())
+        if notice:
+            separator = "&" if "?" in location else "?"
+            location = f"{location}{separator}notice={quote(notice)}"
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Location", location)
+        self.set_security_headers()
+        if clear:
+            self.clear_admin_cookie()
+        elif token:
+            self.set_admin_cookie(token)
         self.end_headers()
 
     def respond_not_found(self):

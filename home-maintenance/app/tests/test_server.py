@@ -16,6 +16,7 @@ class MaintenanceServerTests(unittest.TestCase):
         self.tempdir = tempfile.TemporaryDirectory()
         server.DB_PATH = str(Path(self.tempdir.name) / "home-maintenance.db")
         server.HA_PUBLISHER = None
+        server.ADMIN_SESSIONS.clear()
         server.init_db()
 
     def tearDown(self):
@@ -94,6 +95,7 @@ class MaintenanceServerTests(unittest.TestCase):
         self.assertIn("<title>Replace AC filter</title>", html)
         self.assertIn("<h2>Replace AC filter</h2>", html)
         self.assertIn("Use 20x25x1 filter.", html)
+        self.assertIn("<span>Maintenance ID</span>Mx01", html)
         self.assertIn("<span>Category</span>HVAC", html)
         self.assertIn("<span>Home Assistant area</span>Unassigned", html)
         self.assertIn("<span>Asset</span>Not set", html)
@@ -105,6 +107,7 @@ class MaintenanceServerTests(unittest.TestCase):
         self.assertIn("<span>Created</span>", html)
         self.assertIn("<span>Updated</span>", html)
         self.assertIn("Completion History", html)
+        self.assertIn("Mx01-1", html)
         self.assertIn(today.isoformat(), html)
         self.assertIn('action="/complete/1"', html)
         self.assertIn('action="/snooze/1"', html)
@@ -141,6 +144,7 @@ class MaintenanceServerTests(unittest.TestCase):
         server.save_task(cleaned)
         task = server.get_tasks()[0]
 
+        self.assertEqual(task["public_id"], "Mx01")
         self.assertEqual(task["asset_name"], "Air handler")
         self.assertEqual(task["priority_label"], "High")
         self.assertTrue(task["requires_supplies"])
@@ -159,9 +163,10 @@ class MaintenanceServerTests(unittest.TestCase):
         self.assertEqual(status, server.HTTPStatus.BAD_REQUEST)
 
         self.assertTrue(server.complete_task(task["id"]))
+        self.assertTrue(server.complete_task(task["id"]))
         self.assertFalse(server.get_task_checklist(task["id"])[0]["is_done"])
         report = server.annual_report(today.year)
-        self.assertEqual(report["completed"], 1)
+        self.assertEqual(report["completed"], 2)
         self.assertEqual(report["requires_supplies"], 1)
         health = server.backup_health()
         self.assertEqual(health["status"], "ok")
@@ -169,6 +174,8 @@ class MaintenanceServerTests(unittest.TestCase):
         self.assertNotIn("database_path", health)
 
         csv_output = server.tasks_csv()
+        self.assertIn("Maintenance ID,Name", csv_output)
+        self.assertIn("Mx01", csv_output)
         self.assertIn("Air handler", csv_output)
         self.assertIn("20x25x1", csv_output)
         events = server.get_task_events(task["id"])
@@ -179,6 +186,7 @@ class MaintenanceServerTests(unittest.TestCase):
         self.assertIn("completed", event_types)
         self.assertIn("Air handler", csv_output)
         events_csv = server.events_csv()
+        self.assertIn("Maintenance ID,Task ID", events_csv)
         self.assertIn("Checklist step toggled", events_csv)
         self.assertIn("label=Turn off system", events_csv)
         self.assertNotIn('{"label"', events_csv)
@@ -188,6 +196,17 @@ class MaintenanceServerTests(unittest.TestCase):
         self.assertIn("PASTE_LONG_RANDOM_TOKEN_HERE", setup_html)
         examples = server.homeassistant_examples()
         self.assertIn("/api/actions/mark_done", examples["rest_command_yaml"])
+
+        history = server.get_task_history(task["id"])
+        self.assertEqual([item["public_id"] for item in history], ["Mx01-2", "Mx01-1"])
+        history_csv = server.history_csv()
+        self.assertIn("Iteration ID,Maintenance ID", history_csv)
+        self.assertIn("Mx01-2,Mx01", history_csv)
+
+        payload_item = server.homeassistant_state_payloads()["sensor.mxtracker_all_items"]["attributes"]["items"][0]
+        self.assertEqual(payload_item["public_id"], "Mx01")
+        public = server.public_task(server.get_tasks()[0])
+        self.assertEqual(public["public_id"], "Mx01")
 
     def test_root_query_item_selection_uses_item_detail_renderer(self):
         today = date.today()
@@ -254,6 +273,8 @@ class MaintenanceServerTests(unittest.TestCase):
         self.assertIn('class="button secondary nav-link active" href="/items" aria-current="page"', html)
         self.assertIn('<div class="table-scroll">', html)
         self.assertIn('<table class="task-table audit-table">', html)
+        self.assertIn('<th class="col-id">ID</th>', html)
+        self.assertIn('data-label="ID" class="col-id"><span class="id-badge">Mx01</span>', html)
         self.assertIn('<th class="col-area">Area</th>', html)
         self.assertIn('<td data-label="Area" class="col-area">Kitchen</td>', html)
 
@@ -277,7 +298,7 @@ class MaintenanceServerTests(unittest.TestCase):
 
         html = server.render_items_audit(
             "csrf-token",
-            query={"q": ["dish"], "category": ["Appliances"], "area": ["kitchen"]},
+            query={"q": ["Mx01"], "category": ["Appliances"], "area": ["kitchen"]},
         )
         self.assertIn("Clean dishwasher", html)
         self.assertNotIn("Replace HVAC filter", html)
@@ -409,6 +430,7 @@ class MaintenanceServerTests(unittest.TestCase):
 
         html = server.render_todo_detail(server.get_todo(project_id), "csrf-token")
         self.assertIn("<title>Fix running toilet</title>", html)
+        self.assertIn("<span>Todo ID</span>ToDo-01", html)
         self.assertIn("<span>Status</span>Ready", html)
         self.assertIn("<span>Ready gate</span>1/1", html)
         self.assertIn("Buy flapper", html)
@@ -462,6 +484,7 @@ class MaintenanceServerTests(unittest.TestCase):
         self.assertIn("Risk Map", html)
         self.assertIn("Replace sparking outlet", html)
         self.assertIn("Patch paint chip", html)
+        self.assertIn("ToDo-01", html)
         self.assertIn('href="/todo/new"', html)
 
     def test_delete_confirmation_requires_exact_text_and_uses_trash_affordance(self):
@@ -480,6 +503,126 @@ class MaintenanceServerTests(unittest.TestCase):
         self.assertIn('required pattern="DELETE"', html)
         self.assertIn('class="danger confirm-danger"', html)
         self.assertIn("Delete maintenance item", html)
+
+    def test_admin_mode_removes_wrong_completion_and_restores_due_date(self):
+        today = date.today()
+        self.add_task("Replace HVAC filter", today, "HVAC")
+        task = server.get_tasks()[0]
+        self.assertTrue(server.complete_task(task["id"]))
+        history_item = server.get_task_history(task["id"])[0]
+
+        self.assertEqual(history_item["public_id"], "Mx01-1")
+        self.assertEqual(history_item["previous_next_due_on"], today.isoformat())
+        self.assertFalse(server.admin_unlock_confirmed({"confirm_text": "admin"}))
+        self.assertTrue(server.admin_unlock_confirmed({"confirm_text": "ADMIN"}))
+        self.assertFalse(server.history_delete_confirmed({"confirm_text": "REMOVE Mx01"}, history_item))
+        self.assertTrue(server.history_delete_confirmed({"confirm_text": "REMOVE Mx01-1"}, history_item))
+
+        token, _ = server.create_admin_session()
+        self.assertTrue(server.admin_session_active(token))
+
+        locked_html = server.render_admin_view("csrf-token", admin_enabled=False)
+        self.assertIn("Unlock admin mode", locked_html)
+        self.assertNotIn("Completion History Repair", locked_html)
+        unlocked_html = server.render_admin_view("csrf-token", admin_enabled=True)
+        self.assertIn("Completion History Repair", unlocked_html)
+        self.assertIn("REMOVE Mx01-1", unlocked_html)
+
+        removed = server.delete_completion_history_item(history_item["id"])
+        self.assertEqual(removed["public_id"], "Mx01-1")
+        self.assertEqual(server.get_task_history(task["id"]), [])
+
+        repaired = server.get_tasks()[0]
+        self.assertIsNone(repaired["last_completed_on"])
+        self.assertEqual(repaired["next_due_on"], today.isoformat())
+        event_types = [event["event_type"] for event in server.get_task_events(task["id"])]
+        self.assertIn("completion_removed", event_types)
+
+    def test_admin_mode_edits_completion_closure_fields_and_recalculates_task(self):
+        today = date.today()
+        self.add_task("Replace HVAC filter", today, "HVAC")
+        task = server.get_tasks()[0]
+        self.assertTrue(server.complete_task(task["id"]))
+        history_item = server.get_task_history(task["id"])[0]
+
+        errors, updated = server.update_completion_history_item(
+            history_item["id"],
+            {
+                "completed_on": (today - timedelta(days=1)).isoformat(),
+                "next_due_on": (today + timedelta(days=10)).isoformat(),
+                "closure_type": "skipped",
+                "closure_notes": "Could not reach filter safely.",
+            },
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(updated["closure_type"], "skipped")
+        self.assertEqual(updated["closure_notes"], "Could not reach filter safely.")
+        self.assertEqual(updated["next_due_on"], (today + timedelta(days=10)).isoformat())
+        repaired = server.get_tasks()[0]
+        self.assertIsNone(repaired["last_completed_on"])
+        self.assertEqual(repaired["next_due_on"], (today + timedelta(days=10)).isoformat())
+        self.assertEqual(server.get_completion_count(), 0)
+        event_types = [event["event_type"] for event in server.get_task_events(task["id"])]
+        self.assertIn("completion_edited", event_types)
+
+        errors, updated = server.update_completion_history_item(history_item["id"], {"completed_on": "bad-date", "next_due_on": today.isoformat()})
+        self.assertIsNone(updated)
+        self.assertIn("Closed date must be valid.", errors)
+
+        html = server.render_admin_view("csrf-token", admin_enabled=True)
+        self.assertIn("Save closure fields", html)
+        self.assertIn("Could not reach filter safely.", html)
+        self.assertIn("Reopen Maintenance", html)
+
+    def test_admin_mode_reopens_maintenance_items_and_house_todos(self):
+        today = date.today()
+        self.add_task("Replace HVAC filter", today, "HVAC")
+        task = server.get_tasks()[0]
+        self.assertTrue(server.add_task_checklist_item(task["id"], "Turn off system"))
+        checklist_item = server.get_task_checklist(task["id"])[0]
+        self.assertEqual(server.toggle_task_checklist_item(checklist_item["id"]), task["id"])
+        self.assertTrue(server.complete_task(task["id"]))
+        completed_task = server.get_tasks()[0]
+
+        self.assertTrue(server.task_reopen_confirmed({"confirm_text": "REOPEN Mx01"}, completed_task))
+        reopened_task = server.reopen_task(task["id"])
+        self.assertEqual(reopened_task["next_due_on"], today.isoformat())
+        self.assertFalse(server.get_task_checklist(task["id"])[0]["is_done"])
+        event_types = [event["event_type"] for event in server.get_task_events(task["id"])]
+        self.assertIn("reopened", event_types)
+
+        project_id = server.save_todo(
+            {
+                "title": "Patch paint chip",
+                "category": "Interior",
+                "description": "",
+                "ha_area_id": "",
+                "ha_area_name": "",
+                "likelihood": 1,
+                "consequence": 1,
+                "urgency": 1,
+                "effort": 1,
+                "cost": 1,
+                "status": "done",
+                "target_on": "",
+            }
+        )
+        self.assertTrue(server.add_todo_checklist_item(project_id, "Clean wall"))
+        todo_item = server.get_todo_checklist(project_id)[0]
+        self.assertEqual(server.toggle_todo_checklist_item(todo_item["id"]), project_id)
+        done_todo = server.get_enriched_todo(project_id)
+
+        self.assertEqual(done_todo["derived_status"], "done")
+        self.assertTrue(server.todo_reopen_confirmed({"confirm_text": "REOPEN ToDo-01"}, done_todo))
+        reopened_todo = server.reopen_todo(project_id)
+        self.assertEqual(reopened_todo["derived_status"], "backlog")
+        self.assertEqual(reopened_todo["status"], "backlog")
+        self.assertFalse(server.get_todo_checklist(project_id)[0]["is_done"])
+
+        html = server.render_admin_view("csrf-token", admin_enabled=True)
+        self.assertIn("Reopen House Todos", html)
+        self.assertIn("REOPEN ToDo-01", html)
 
     def test_house_todo_filters_keep_default_active_view_and_allow_done_audit(self):
         server.save_todo(
@@ -548,11 +691,13 @@ class MaintenanceServerTests(unittest.TestCase):
 
         self.assertEqual(payload["state"], "1")
         self.assertEqual(payload["attributes"]["in_work_count"], 1)
+        self.assertEqual(item["public_id"], "ToDo-01")
         self.assertEqual(item["title"], "Replace kitchen faucet")
         self.assertEqual(item["detail_url"], "/todo/1")
         self.assertIn("[Replace kitchen faucet](/todo/1)", payload["attributes"]["markdown_table"])
 
         public = server.public_todo(server.get_enriched_todo(project_id))
+        self.assertEqual(public["public_id"], "ToDo-01")
         self.assertEqual(public["status"], "in_work")
         self.assertIn("priority_score", public)
 

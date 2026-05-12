@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.0.4
+
+- Added closure type and closure notes to maintenance completion history.
+- Added a richer item-detail closure form for Done, Skipped, Not needed, and Partial outcomes.
+- Kept quick Done actions fast while preserving detailed audit fields in history, reports, admin repair, and CSV export.
+- Expanded Admin mode with editable completion fields and typed-confirm reopen actions for both maintenance items and House todos.
+
+## 2.0.3
+
+- Added short-lived Admin mode for repair-only actions.
+- Added an admin-only workflow to remove wrongly recorded maintenance completions with typed confirmation.
+- Restored task last-done and next-due values from remaining completion history after a repair.
+
+## 2.0.2
+
+- Added human-readable IDs for maintenance items, House todos, and each maintenance completion iteration.
+- Exposed IDs in detail pages, dashboard/focus/audit/calendar views, Home Assistant sensor payloads, Markdown tables, APIs, and CSV exports.
+- Added ID-aware search for maintenance items and House todos.
+
 ## 2.0.1
 
 - Grouped navigation into Maintenance, Projects, and System sections so recurring maintenance and House todos have clearer workflows.
