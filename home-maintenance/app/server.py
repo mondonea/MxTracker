@@ -59,7 +59,7 @@ CSRF_COOKIE = "hm_csrf"
 THEME_COOKIE = "hm_theme"
 ADMIN_COOKIE = "hm_admin"
 THEMES = {"system", "light", "dark"}
-APP_VERSION = "2.0.4"
+APP_VERSION = "2.0.5"
 MAX_FORM_BYTES = 16 * 1024
 ADMIN_SESSION_SECONDS = 15 * 60
 CSRF_TOKEN_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
@@ -2665,6 +2665,8 @@ def reopen_task(task_id):
     task = get_task(task_id)
     if not task:
         return None
+    if not get_task_history(task_id, limit=1):
+        return None
     now = utc_now_iso()
     due_on = today_iso()
     with connect_db() as conn:
@@ -2676,8 +2678,10 @@ def reopen_task(task_id):
 
 
 def reopen_todo(project_id):
-    todo = get_todo(project_id)
+    todo = get_enriched_todo(project_id)
     if not todo:
+        return None
+    if todo["derived_status"] != "done":
         return None
     now = utc_now_iso()
     with connect_db() as conn:
@@ -3685,7 +3689,7 @@ def render_dashboard(csrf_token, notice="", theme="system", base_path=""):
             last_done = escape(task["last_completed_on"] or "Never")
             notes = f'<div class="meta">{escape(task["notes"])}</div>' if task["notes"] else ""
             area = f'<div class="meta">Area {escape(task["ha_area_name"])}</div>' if task.get("ha_area_name") else ""
-            complete_url = app_url(f"/complete/{task_id}", base_path)
+            complete_url = app_url(f"/complete/{task_id}?return_to={quote(return_to, safe='')}", base_path)
             snooze_url = app_url(f"/snooze/{task_id}", base_path)
             edit_url = app_url(f"/edit/{task_id}", base_path)
             snooze = ""
@@ -3715,11 +3719,7 @@ def render_dashboard(csrf_token, notice="", theme="system", base_path=""):
                   <td data-label="Repeat" class="col-repeat">{escape(task["recurrence_phrase"])}</td>
                   <td data-label="Actions" class="col-actions">
                     <div class="quick-actions">
-                      <form class="inline" action="{complete_url}" method="post">
-                        <input type="hidden" name="csrf_token" value="{csrf_token}">
-                        <input type="hidden" name="return_to" value="{escape(return_to)}">
-                        <button type="submit">Done</button>
-                      </form>
+                      <a class="button" href="{complete_url}">Mark done</a>
                       {snooze}
                       <a class="button secondary" href="{edit_url}">Edit</a>
                     </div>
@@ -4251,7 +4251,8 @@ def render_admin_view(csrf_token, admin_enabled=False, notice="", theme="system"
         )
     table_body = "".join(rows) if rows else '<tr><td colspan="7" class="empty">No completion history to repair.</td></tr>'
     maintenance_rows = []
-    for task in get_tasks():
+    closed_tasks = [task for task in get_tasks() if get_task_history(task["id"], limit=1)]
+    for task in closed_tasks:
         confirm_phrase = f"REOPEN {task['public_id']}"
         maintenance_rows.append(
             f"""
@@ -4276,7 +4277,8 @@ def render_admin_view(csrf_token, admin_enabled=False, notice="", theme="system"
         )
     maintenance_body = "".join(maintenance_rows) if maintenance_rows else '<tr><td colspan="5" class="empty">No maintenance items to reopen.</td></tr>'
     todo_rows = []
-    for todo in get_todos():
+    closed_todos = [todo for todo in get_todos() if todo["derived_status"] == "done"]
+    for todo in closed_todos:
         confirm_phrase = f"REOPEN {todo['public_id']}"
         todo_rows.append(
             f"""
@@ -4391,7 +4393,7 @@ def render_items_audit(csrf_token, query=None, notice="", theme="system", base_p
             asset = f'<div class="meta">{escape(task["asset_name"])}</div>' if task.get("asset_name") else ""
             priority = f'<div class="meta">{escape(task["priority_label"])}</div>' if task.get("priority") != "normal" else ""
             area_name = task.get("ha_area_name") or "Unassigned"
-            complete_url = app_url(f"/complete/{task_id}", base_path)
+            complete_url = app_url(f"/complete/{task_id}?return_to={quote('/items', safe='')}", base_path)
             edit_url = app_url(f"/edit/{task_id}", base_path)
             rows.append(
                 f"""
@@ -4414,11 +4416,7 @@ def render_items_audit(csrf_token, query=None, notice="", theme="system", base_p
                   <td data-label="Repeat" class="col-repeat">{escape(task["recurrence_phrase"])}</td>
                   <td data-label="Actions" class="col-actions">
                     <div class="quick-actions">
-                      <form class="inline" action="{complete_url}" method="post">
-                        <input type="hidden" name="csrf_token" value="{csrf_token}">
-                        <input type="hidden" name="return_to" value="/items">
-                        <button type="submit">Done</button>
-                      </form>
+                      <a class="button" href="{complete_url}">Mark done</a>
                       <a class="button secondary" href="{edit_url}">Edit</a>
                     </div>
                   </td>
@@ -4511,6 +4509,61 @@ def render_items_audit(csrf_token, query=None, notice="", theme="system", base_p
     return render_layout("Maintenance Audit", body, csrf_token, notice, theme, base_path, active_view="audit")
 
 
+def render_closure_fields(task, csrf_token, return_to="/", base_path=""):
+    closure_options = "".join(f'<option value="{key}">{escape(label)}</option>' for key, label in CLOSURE_LABELS.items())
+    return f"""
+      <form action="{app_url(f"/complete/{task["id"]}", base_path)}" method="post">
+        <input type="hidden" name="csrf_token" value="{csrf_token}">
+        <input type="hidden" name="return_to" value="{escape(return_to)}">
+        <label for="closure_type">Closure type</label>
+        <select id="closure_type" name="closure_type" required>{closure_options}</select>
+        <label for="closure_notes">Closure notes</label>
+        <textarea id="closure_notes" name="closure_notes" maxlength="1000" placeholder="What happened, what was skipped, parts used, or why it was not needed"></textarea>
+        <div class="actions form-actions">
+          <button type="submit">Save closure</button>
+        </div>
+      </form>
+    """
+
+
+def render_complete_task_view(task, csrf_token, return_to="/", notice="", theme="system", base_path=""):
+    return_to = safe_return_path(return_to)
+    area_name = task.get("ha_area_name") or "Unassigned"
+    body = f"""
+      <section class="panel detail-hero">
+        <div class="table-head">
+          <div>
+            <h2>Close Maintenance Item</h2>
+            <div class="meta">{escape(task["public_id"])} - {escape(task["name"])}</div>
+          </div>
+          <span class="badge {task["status"]}">{escape(task["due_phrase"])}</span>
+        </div>
+        <div class="detail-grid">
+          <div class="detail-field"><span>Category</span>{escape(task["category"])}</div>
+          <div class="detail-field"><span>Home Assistant area</span>{escape(area_name)}</div>
+          <div class="detail-field"><span>Last done</span>{escape(task["last_completed_on"] or "Never")}</div>
+          <div class="detail-field"><span>Current due date</span>{escape(task["next_due_on"])}</div>
+          <div class="detail-field"><span>Repeat</span>{escape(task["recurrence_phrase"])}</div>
+          <div class="detail-field"><span>Estimated time</span>{escape(task.get("estimated_minutes") or 0)} min</div>
+        </div>
+        <div class="detail-section">
+          <div class="table-head">
+            <div>
+              <h2>Closure Details</h2>
+              <div class="meta">Choose what happened before this item is recorded in maintenance history.</div>
+            </div>
+          </div>
+          {render_closure_fields(task, csrf_token, return_to, base_path)}
+        </div>
+        <div class="actions form-actions">
+          <a class="button secondary" href="{app_url(return_to, base_path)}">Cancel</a>
+          <a class="button secondary" href="{app_url(f"/item/{task["id"]}", base_path)}">Open item details</a>
+        </div>
+      </section>
+    """
+    return render_layout("Close Maintenance Item", body, csrf_token, notice, theme, base_path, active_view="")
+
+
 def render_item_detail(task, csrf_token, notice="", theme="system", base_path=""):
     history = get_task_history(task["id"])
     checklist = get_task_checklist(task["id"])
@@ -4519,10 +4572,11 @@ def render_item_detail(task, csrf_token, notice="", theme="system", base_path=""
     status_class = " overdue" if task["status"] == "overdue" else ""
     area_name = task.get("ha_area_name") or "Unassigned"
     complete_url = app_url(f"/complete/{task['id']}", base_path)
+    return_to = f"/item/{task['id']}"
+    complete_prompt_url = app_url(f"/complete/{task['id']}?return_to={quote(return_to, safe='')}", base_path)
     snooze_url = app_url(f"/snooze/{task['id']}", base_path)
     edit_url = app_url(f"/edit/{task['id']}", base_path)
     delete_url = f'{app_url(f"/delete/{task["id"]}", base_path)}?return_to={quote(f"/item/{task["id"]}", safe="")}'
-    return_to = f"/item/{task['id']}"
     checklist_items = []
     for item in checklist:
         checked = " checked" if item["is_done"] else ""
@@ -4543,7 +4597,6 @@ def render_item_detail(task, csrf_token, notice="", theme="system", base_path=""
             """
         )
     checklist_html = "".join(checklist_items) if checklist_items else '<div class="empty">No checklist steps yet.</div>'
-    closure_options = "".join(f'<option value="{key}">{escape(label)}</option>' for key, label in CLOSURE_LABELS.items())
 
     if history:
         history_rows = []
@@ -4634,12 +4687,7 @@ def render_item_detail(task, csrf_token, notice="", theme="system", base_path=""
           </form>
         </div>
         <div class="actions form-actions">
-          <form class="inline" action="{complete_url}" method="post">
-            <input type="hidden" name="csrf_token" value="{csrf_token}">
-            <input type="hidden" name="return_to" value="{escape(return_to)}">
-            <input type="hidden" name="closure_type" value="done">
-            <button type="submit">Mark done</button>
-          </form>
+          <a class="button" href="{complete_prompt_url}">Mark done</a>
           <form class="inline" action="{snooze_url}" method="post">
             <input type="hidden" name="csrf_token" value="{csrf_token}">
             <input type="hidden" name="return_to" value="{escape(return_to)}">
@@ -4648,24 +4696,14 @@ def render_item_detail(task, csrf_token, notice="", theme="system", base_path=""
           <a class="button secondary" href="{edit_url}">Edit</a>
           <a class="button danger" href="{delete_url}">Delete</a>
         </div>
-        <div class="detail-section">
+        <div class="detail-section" id="close-maintenance">
           <div class="table-head">
             <div>
-              <h2>Record Closure</h2>
-              <div class="meta">Use this when you need notes or a closure type other than Done.</div>
+              <h2>Closure Details</h2>
+              <div class="meta">Choose what happened before this item is recorded in maintenance history.</div>
             </div>
           </div>
-          <form action="{complete_url}" method="post">
-            <input type="hidden" name="csrf_token" value="{csrf_token}">
-            <input type="hidden" name="return_to" value="{escape(return_to)}">
-            <label for="closure_type">Closure type</label>
-            <select id="closure_type" name="closure_type">{closure_options}</select>
-            <label for="closure_notes">Closure notes</label>
-            <textarea id="closure_notes" name="closure_notes" maxlength="1000" placeholder="What happened, what was skipped, parts used, or why it was not needed"></textarea>
-            <div class="actions form-actions">
-              <button type="submit">Record closure</button>
-            </div>
-          </form>
+          {render_closure_fields(task, csrf_token, return_to, base_path)}
         </div>
       </section>
       <section class="panel table-panel">
@@ -5201,6 +5239,17 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
         if parsed.path == "/focus":
             notice = parse_qs(parsed.query).get("notice", [""])[0]
             self.respond_html(render_focus_view(csrf, notice=notice, theme=theme, base_path=base_path), csrf)
+            return
+        if parsed.path.startswith("/complete/"):
+            task_id = self.extract_id(parsed.path, "/complete/")
+            task = get_enriched_task(task_id) if task_id else None
+            if not task:
+                self.redirect("/", "Item not found.")
+                return
+            query = parse_qs(parsed.query)
+            return_to = safe_return_path(query.get("return_to", [safe_referer_path(self.headers.get("Referer"), base_path)])[0])
+            notice = query.get("notice", [""])[0]
+            self.respond_html(render_complete_task_view(task, csrf, return_to=return_to, notice=notice, theme=theme, base_path=base_path), csrf)
             return
         if parsed.path.startswith("/item/"):
             task_id = self.extract_id(parsed.path, "/item/")

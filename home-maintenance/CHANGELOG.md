@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.0.5
+
+- Changed normal Mark done actions to open a closure prompt for type and notes before recording maintenance history.
+- Added a dedicated Close Maintenance Item screen for dashboard and audit workflows.
+- Restricted Admin reopen actions to maintenance items with completion history and House todos that are actually closed.
+- Added server-side guards so crafted reopen requests cannot reopen never-closed maintenance items or active House todos.
+
 ## 2.0.4
 
 - Added closure type and closure notes to maintenance completion history.

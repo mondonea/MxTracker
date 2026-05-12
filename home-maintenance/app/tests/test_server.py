@@ -109,10 +109,34 @@ class MaintenanceServerTests(unittest.TestCase):
         self.assertIn("Completion History", html)
         self.assertIn("Mx01-1", html)
         self.assertIn(today.isoformat(), html)
+        self.assertIn('href="/complete/1?return_to=%2Fitem%2F1"', html)
         self.assertIn('action="/complete/1"', html)
+        self.assertIn("Closure Details", html)
+        self.assertIn('name="closure_type"', html)
+        self.assertIn('name="closure_notes"', html)
         self.assertIn('action="/snooze/1"', html)
         self.assertIn('href="/edit/1"', html)
         self.assertIn('href="/delete/1?return_to=%2Fitem%2F1"', html)
+
+    def test_mark_done_uses_closure_prompt_instead_of_instant_dashboard_post(self):
+        today = date.today()
+        self.add_task("Clean dishwasher", today, "Appliances", "Run cleaning cycle.")
+        task = server.get_tasks()[0]
+
+        dashboard = server.render_dashboard("csrf-token")
+        self.assertIn('href="/complete/1?return_to=%2F"', dashboard)
+        self.assertNotIn('<form class="inline" action="/complete/1" method="post">', dashboard)
+
+        audit = server.render_items_audit("csrf-token")
+        self.assertIn('href="/complete/1?return_to=%2Fitems"', audit)
+
+        prompt = server.render_complete_task_view(task, "csrf-token", return_to="/")
+        self.assertIn("<title>Close Maintenance Item</title>", prompt)
+        self.assertIn("Closure Details", prompt)
+        self.assertIn("Choose what happened before this item is recorded", prompt)
+        self.assertIn('name="closure_type"', prompt)
+        self.assertIn('name="closure_notes"', prompt)
+        self.assertIn('action="/complete/1"', prompt)
 
     def test_task_asset_fields_checklist_reports_and_action_api(self):
         today = date.today()
@@ -579,6 +603,9 @@ class MaintenanceServerTests(unittest.TestCase):
         today = date.today()
         self.add_task("Replace HVAC filter", today, "HVAC")
         task = server.get_tasks()[0]
+        self.assertIsNone(server.reopen_task(task["id"]))
+        locked_admin_html = server.render_admin_view("csrf-token", admin_enabled=True)
+        self.assertNotIn("REOPEN Mx01", locked_admin_html)
         self.assertTrue(server.add_task_checklist_item(task["id"], "Turn off system"))
         checklist_item = server.get_task_checklist(task["id"])[0]
         self.assertEqual(server.toggle_task_checklist_item(checklist_item["id"]), task["id"])
@@ -608,6 +635,22 @@ class MaintenanceServerTests(unittest.TestCase):
                 "target_on": "",
             }
         )
+        active_project_id = server.save_todo(
+            {
+                "title": "Buy paint",
+                "category": "Interior",
+                "description": "",
+                "ha_area_id": "",
+                "ha_area_name": "",
+                "likelihood": 1,
+                "consequence": 1,
+                "urgency": 1,
+                "effort": 1,
+                "cost": 1,
+                "status": "backlog",
+                "target_on": "",
+            }
+        )
         self.assertTrue(server.add_todo_checklist_item(project_id, "Clean wall"))
         todo_item = server.get_todo_checklist(project_id)[0]
         self.assertEqual(server.toggle_todo_checklist_item(todo_item["id"]), project_id)
@@ -615,14 +658,18 @@ class MaintenanceServerTests(unittest.TestCase):
 
         self.assertEqual(done_todo["derived_status"], "done")
         self.assertTrue(server.todo_reopen_confirmed({"confirm_text": "REOPEN ToDo-01"}, done_todo))
+        self.assertIsNone(server.reopen_todo(active_project_id))
+        html = server.render_admin_view("csrf-token", admin_enabled=True)
+        self.assertIn("Reopen House Todos", html)
+        self.assertIn("REOPEN ToDo-01", html)
+        self.assertNotIn("REOPEN ToDo-02", html)
         reopened_todo = server.reopen_todo(project_id)
         self.assertEqual(reopened_todo["derived_status"], "backlog")
         self.assertEqual(reopened_todo["status"], "backlog")
         self.assertFalse(server.get_todo_checklist(project_id)[0]["is_done"])
 
         html = server.render_admin_view("csrf-token", admin_enabled=True)
-        self.assertIn("Reopen House Todos", html)
-        self.assertIn("REOPEN ToDo-01", html)
+        self.assertNotIn("REOPEN ToDo-01", html)
 
     def test_house_todo_filters_keep_default_active_view_and_allow_done_audit(self):
         server.save_todo(
